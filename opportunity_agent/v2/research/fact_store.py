@@ -25,10 +25,21 @@ async def persist_verified_page(session, program, page, facts):
             and parsed.port in {None, 443} and any(host == d or host.endswith("." + d) for d in record["domains"])):
         raise ValueError("Fact persistence requires a verified official HTTPS source")
     match, _, _ = classify_program_page(name, title, url, body)
-    observed_intake = source_intake(intake, body)
-    if match != "exact":
+    semantic = bool(facts) and all(f.get("provenance", {}).get("version") for f in facts)
+    observed_intake = "" if semantic else source_intake(intake, body)
+    if not semantic and match != "exact":
         raise ValueError("Fact persistence requires an exact programme")
     for fact in facts:
+        if semantic:
+            from .extraction import AdmissionFact, verify_fact
+            extracted = AdmissionFact.model_validate(fact["provenance"]["fact"])
+            proof, reason = verify_fact(extracted, program, page, [fact["field"]], date.today())
+            if (reason or (proof and proof.get('year_status') == 'unknown')
+                    or extracted.field != fact["field"] or extracted.value != fact["value"]
+                    or extracted.quote != fact["quote"]):
+                raise ValueError("Semantic observation failed independent persistence verification")
+            fact["provenance"] = proof
+            continue
         if (fact["field"] not in {"deadline", "gre_policy", "tuition", "language"}
                 or not fact["quote"] or fact["quote"] not in body
                 or not supported_value(fact["field"], fact["value"], fact["quote"], intake)):
@@ -79,19 +90,21 @@ async def persist_verified_page(session, program, page, facts):
                 old.status = "superseded"
         for fact in values.values():
             qualifier = fact["value"] if field == "gre_policy" else fact.get("qualifier", "")
-            if not observed_intake:
+            if not (fact["provenance"]["intake"] if semantic else observed_intake):
                 qualifier = CURRENT_POLICY_PREFIX + qualifier
             qualifier = qualifier[:64]
             prior = next((o for o in active if o.content_hash == digest and o.value == fact["value"] and o.excerpt == fact["quote"]), None)
             if prior:
                 prior.verified_at, prior.expires_at = now, expires
                 prior.qualifier = qualifier
+                prior.extraction_provenance = fact.get("provenance", {})
                 refreshed += 1
             else:
                 session.add(ResearchRequirement(program_id=row.id, source_id=source.id, field=field,
                     value=fact["value"], date_value=date.fromisoformat(fact["value"]) if field == "deadline" else None,
                     qualifier=qualifier,
                     excerpt=fact["quote"], content_hash=digest, verified_at=now, expires_at=expires,
+                    extraction_provenance=fact.get("provenance", {}),
                     status="verified", program_match="exact"))
                 written += 1
     await session.flush()

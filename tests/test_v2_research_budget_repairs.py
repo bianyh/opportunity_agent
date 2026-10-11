@@ -125,7 +125,8 @@ def test_first_school_extraction_timeout_does_not_abort_second_school(monkeypatc
         def generate_structured(self, *args, **kwargs):
             if "Brown" in kwargs["context"]["university"]:
                 raise TimeoutError("offline fault injection")
-            return WebExtraction(intake="2027 Fall", facts=[
+            from research_response_fixtures import structured
+            return structured(kwargs['context'], [
                 WebFact(field="gre_policy", value="not_required", quote="GRE is not required.")])
     async def run():
         service = ResearchService(None, llm=Model(), web_factory=Web)

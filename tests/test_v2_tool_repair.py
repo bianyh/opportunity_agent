@@ -48,7 +48,8 @@ class Model:
     def generate_structured(self, *args, **kwargs):
         self.requests.append(kwargs)
         if self.errors: raise self.errors.pop(0)
-        return WebExtraction(intake="2027 Fall", facts=[WebFact(
+        from research_response_fixtures import structured
+        return structured(kwargs['context'], [WebFact(
             field="gre_policy", value="not_required", quote="GRE is not required.")])
 
 
@@ -167,14 +168,14 @@ def test_bad_decisions_are_feedback_and_do_not_invoke_tools():
     asyncio.run(run())
 
 
-def test_year_mismatch_does_not_call_extraction_model():
+def test_year_mismatch_is_rejected_after_semantic_extraction():
     async def run():
         model = Model()
-        service, task, target = setup(Web(text="MSCS Fall 2026 GRE not required."), model,
+        service, task, target = setup(Web(text="MSCS Fall 2026. GRE is not required."), model,
             [RepairDecision(action="skip_target")])
         result = ResearchResult()
         await service._web(task, result, [target])
-        assert not model.requests and not result.programs
+        assert model.requests and not result.programs
         assert any(e["code"] == "INTAKE_UNSUPPORTED" for e in result.errors)
     asyncio.run(run())
 
@@ -497,7 +498,7 @@ def test_wrong_page_advances_to_next_candidate_without_repair_model():
         result = ResearchResult()
         await service._web(task, result, [target])
         assert result.programs[0].gre_policy == "not_required"
-        assert len(service.llm.requests) == 1  # Wrong programme rejected before any model extraction.
+        assert len(service.llm.requests) == 1  # No requested-field candidate on irrelevant page: no paid extraction.
         assert not service.repair_planner.contexts
     asyncio.run(run())
 
@@ -510,7 +511,8 @@ def test_planner_timeout_uses_compact_once_and_never_replays_completed_target():
         await service._web(task, first, [target])
         assert first.programs[0].gre_policy == "not_required"
         assert len(model.requests) == 2
-        assert len(model.requests[-1]["context"]["text"]) <= 4000
+        assert sum(len(b['text'])+sum(map(len,b['headings']))
+                   for b in model.requests[-1]['context']['blocks']) <= 2500
         second = ResearchResult()
         await service._web(task, second, [target])
         assert second.programs[0].gre_policy == "not_required"
@@ -550,7 +552,10 @@ def test_extraction_payload_and_repair_payload_do_not_inject_history():
     payloads = []
     def extract(payload):
         payloads.append(payload)
-        return '{"intake":"2027 Fall","facts":[{"field":"gre_policy","value":"not_required","quote":"GRE is not required."}]}'
+        import json
+        from research_response_fixtures import structured
+        context = json.loads(payload['messages'][-1]['content'])['context']
+        return structured(context,[WebFact(field='gre_policy',value='not_required',quote='GRE is not required.')]).model_dump_json()
     def repair(payload):
         payloads.append(payload)
         return '{"action":"skip_target"}'

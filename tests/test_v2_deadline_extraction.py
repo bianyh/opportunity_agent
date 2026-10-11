@@ -1,4 +1,4 @@
-"""Deterministic deadline/GRE extraction: one date grammar, intake-cycle years."""
+"""Legacy normalization regression plus semantic-path/no-regex-fallback checks."""
 import pytest
 
 from opportunity_agent.official_research import classify_program_page
@@ -94,10 +94,23 @@ def test_keyword_facts_ignore_other_degrees_and_cycles():
 
 
 class NoModel:
-    """Fails the test if the model is called; keyword pass must cover the fields."""
+    """Recorded semantic response for these source fixtures."""
     enabled = True
     def generate_structured(self, *args, **kwargs):
-        raise AssertionError("model must not be called")
+        from opportunity_agent.v2.research.service import WebFact
+        from research_response_fixtures import structured
+        text = kwargs['context']['blocks'][0]['text']
+        quote = ('The application deadline is January 15, 2026.' if 'January 15, 2026' in text
+                 else 'The application deadline is Feb. 1 for admission to the following fall semester.')
+        facts = [WebFact(field='gre_policy',value='not_required',quote=(
+            'A GRE score is not required for admission to the MSCS program.' if 'A GRE score' in text else 'GRE is not required.')),
+            WebFact(field='deadline',value='2026-01-15' if '2026' in quote else '2027-02-01',quote=quote)]
+        response = structured(kwargs['context'], facts)
+        for fact in response.facts:
+            fact.program_quote = 'MS Computer Science'
+            if fact.field == 'deadline':
+                fact.date_text = 'January 15, 2026' if '2026' in fact.quote else 'Feb. 1'
+        return response
 
 
 def _accept(page_text, fields=("deadline", "gre_policy"), llm=None, **kwargs):
@@ -126,19 +139,18 @@ def no_persist(monkeypatch):
     monkeypatch.setenv("RESEARCH_KEYWORD_EXTRACTION", "1")
 
 
-def test_accept_page_keyword_path_skips_model(no_persist):
-    from datetime import date
+def test_accept_page_uses_model_and_rejects_invented_year(no_persist):
     result = _accept(GATECH)
     program = result.programs[0]
-    assert program.deadline == date(2027, 2, 1) and program.gre_policy == "not_required"
-    assert not result.diagnostics.get("extraction_attempts")
+    assert program.deadline is None and program.gre_policy == "not_required"
+    assert len(result.diagnostics['extraction_attempts']) == 1
     assert all(e.temporal_scope == "current_policy" for e in program.evidence)
 
 
-def test_accept_page_keyword_path_runs_with_open_circuit(no_persist):
+def test_accept_page_open_circuit_does_not_use_keywords(no_persist):
     from opportunity_agent.v2.research.repair import ToolFailure
     result = _accept(GATECH, llm_blocked="EXTRACTION_CIRCUIT_OPEN")
-    assert result.programs[0].gre_policy == "not_required"
+    assert not result.programs
     with pytest.raises(ToolFailure, match="EXTRACTION_CIRCUIT_OPEN"):
         import opportunity_agent.v2.research.service as service_module
         service = service_module.ResearchService(None, llm=NoModel())
@@ -155,12 +167,12 @@ def test_accept_page_keyword_path_runs_with_open_circuit(no_persist):
             llm_blocked="EXTRACTION_CIRCUIT_OPEN"))
 
 
-def test_accept_page_keyword_path_rejects_expired_and_wrong_cycle(no_persist):
+def test_accept_page_semantic_verifier_rejects_expired_and_wrong_cycle(no_persist):
     expired = _accept("MSCS. The application deadline is January 15, 2026. GRE is not required.", llm=None)
     assert expired.programs[0].deadline is None
     assert any(r["reason"] == "expired_deadline" for r in expired.diagnostics["web_field_rejections"])
     wrong = _accept("MSCS admissions for Fall 2026. The deadline is Feb. 1. GRE is not required.")
-    assert not wrong.programs  # explicit other cycle is rejected before any extraction
+    assert not wrong.programs  # explicit other cycle is rejected after extraction
 
 
 def test_data_science_page_is_not_cse():

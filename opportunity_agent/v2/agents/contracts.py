@@ -81,6 +81,7 @@ class Evidence(BaseModel):
     relevance_passed: bool | None = None
     raw_scores: dict[str, float] = Field(default_factory=dict)
     model_version: str = ""
+    extraction_provenance: dict[str, Any] = Field(default_factory=dict)
     expires_at: date | None = None
     url: HttpUrl | None = None
     excerpt: str = ""
@@ -135,6 +136,8 @@ class ProgramResult(BaseModel):
     required_country: str = ""
     university: str
     program: str
+    degree: str = ""
+    home_unit: str = ""
     intake: str = ""
     deadline: date | None = None
     gre_policy: Literal["required", "not_required", "optional", "not_accepted", "unknown"] = "unknown"

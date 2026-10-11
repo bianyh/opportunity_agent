@@ -85,8 +85,10 @@ class ControlledExtraction:
     enabled = True
 
     def generate_structured(self, model, **_kwargs):
-        assert model is research_service.WebExtraction
-        return model(university="CMU", program="MSCS", intake="2027 Fall", facts=[
+        from opportunity_agent.v2.research.extraction import AdmissionExtraction
+        from research_response_fixtures import structured
+        assert model is AdmissionExtraction
+        return structured(_kwargs['context'], [
             research_service.WebFact(field="gre_policy", value="optional", quote="GRE is optional."),
             research_service.WebFact(field="deadline", value="2026-12-10", quote="Application deadline: December 10, 2026.")])
 

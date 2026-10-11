@@ -321,8 +321,7 @@ class BoundedWebRunner:
                    and o.get("arguments", {}).get("profile") == args.profile and set(o.get("arguments", {}).get("fields", [])) == set(args.fields)
                    for o in self.ledger.state.get("calls", [])):
                 raise ToolFailure("UNCHANGED_EXTRACTION_RETRY")
-            # An open model circuit only disables the model; the deterministic
-            # keyword pass in _accept_page still runs and raises if it finds nothing.
+            # An open circuit must not bypass semantic extraction/evidence gates.
             llm_blocked = ""
             try:
                 await self.ledger.circuit(self.channel, "check", minimum_remaining=remaining)

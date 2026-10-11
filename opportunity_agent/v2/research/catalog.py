@@ -85,9 +85,11 @@ class ResearchCatalog:
             expired = observation.expires_at and observation.expires_at.date() < today
             status = "stale" if expired else "verified" if verified else "unknown"
             current_policy = observation.qualifier.startswith(CURRENT_POLICY_PREFIX)
+            proof = observation.extraction_provenance or {}
             evidence = Evidence(source_id=source.id, url=source.url, title=source.title,
                 excerpt=observation.excerpt, content_hash=observation.content_hash, intake="" if current_policy else row.intake,
-                temporal_scope="current_policy" if current_policy else "legacy",
+                temporal_scope="current_policy" if current_policy else "explicit_intake" if proof else "legacy",
+                extraction_provenance=proof,
                 authority="official" if source.status == "verified" else "rejected",
                 program_match=observation.program_match if observation.program_match in {"exact", "unknown", "rejected"} else "unknown",
                 retrieved_at=observation.verified_at.date(),
@@ -100,7 +102,12 @@ class ResearchCatalog:
             grouped.setdefault(observation.field, []).append(fact)
         for field, facts in grouped.items():
             valid = [f for f in facts if f.verification_status == "verified"]
-            if len({json.dumps(f.value, sort_keys=True) for f in valid}) > 1:
+            from .extraction import program_key
+            identities = {program_key(e.extraction_provenance['fact']['program']) for e in result.evidence
+                          if e.extraction_provenance.get('fact')}
+            units = {e.extraction_provenance.get("fact", {}).get("home_unit", "").casefold()
+                     for e in result.evidence if e.extraction_provenance.get("fact", {}).get("home_unit")}
+            if len({json.dumps(f.value, sort_keys=True) for f in valid}) > 1 or len(units) > 1 or len(identities) > 1:
                 for f in valid:
                     f.verification_status = "conflicting"
             elif valid:

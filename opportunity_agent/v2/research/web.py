@@ -85,7 +85,9 @@ class ResearchTextParser(_TextParser):
         if self._is_main_root(tag, attrs):
             self._main_roots.append(tag)
             self.has_main_content = True
-        if tag in self._BLOCK_TAGS:
+        if tag in {"td", "th"}:
+            self._append(" | ")
+        elif tag in self._BLOCK_TAGS:
             self._boundary()
         if tag in {"h1", "h2", "h3", "h4", "h5", "h6"}:
             self.heading, self.heading_parts = int(tag[1]), []
@@ -108,7 +110,7 @@ class ResearchTextParser(_TextParser):
         if self.heading and tag == "h" + str(self.heading):
             self._append("#" * self.heading + " " + " ".join(self.heading_parts).strip())
             self.heading = None
-        if tag in self._BLOCK_TAGS:
+        if tag in self._BLOCK_TAGS and tag not in {"td", "th"}:
             self._boundary()
         for index in range(len(self._main_roots) - 1, -1, -1):
             if self._main_roots[index] == tag:

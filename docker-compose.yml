@@ -11,12 +11,21 @@ x-research-budget: &research-budget
   RESEARCH_MAX_BUDGET_SECONDS: ${RESEARCH_MAX_BUDGET_SECONDS:-600}
   RESEARCH_DISCOVERY_SCHOOL_COUNT: ${RESEARCH_DISCOVERY_SCHOOL_COUNT:-10}
   RESEARCH_EXTRACT_TIMEOUT_SECONDS: ${RESEARCH_EXTRACT_TIMEOUT_SECONDS:-30}
+  RESEARCH_FAST_MODEL: ${RESEARCH_FAST_MODEL:-}
+  RESEARCH_PARSE_MODEL: ${RESEARCH_PARSE_MODEL:-}
+  RESEARCH_DISCOVERY_MODEL: ${RESEARCH_DISCOVERY_MODEL:-}
+  RESEARCH_EXTRACT_CONTEXT_CHARS: ${RESEARCH_EXTRACT_CONTEXT_CHARS:-5000}
+  RESEARCH_EXTRACT_OUTPUT_MODE: ${RESEARCH_EXTRACT_OUTPUT_MODE:-prompt}
   RESEARCH_TARGET_MAX_ATTEMPTS: ${RESEARCH_TARGET_MAX_ATTEMPTS:-3}
   RESEARCH_EXTRACT_FAILURE_LIMIT: ${RESEARCH_EXTRACT_FAILURE_LIMIT:-3}
   EXECUTION_OVERHEAD_SECONDS: ${EXECUTION_OVERHEAD_SECONDS:-180}
   EXECUTION_MAX_BUDGET_SECONDS: ${EXECUTION_MAX_BUDGET_SECONDS:-1800}
 
 services:
+  # Same image/ports as the optional research overlay; available in default Compose too.
+  jaeger:
+    image: cr.jaegertracing.io/jaegertracing/jaeger:2.21.0
+    ports: ["127.0.0.1:16686:16686", "127.0.0.1:4318:4318"]
   postgres:
     image: pgvector/pgvector:pg16
     environment:
@@ -59,6 +68,10 @@ services:
       SYNTHESIZER_BUDGET_SECONDS: ${SYNTHESIZER_BUDGET_SECONDS:-90}
       SYNTHESIZER_MAX_TOKENS: ${SYNTHESIZER_MAX_TOKENS:-1400}
       MEMORY_VECTOR_ENABLED: ${MEMORY_VECTOR_ENABLED:-0}
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
+      OTEL_SERVICE_NAME: opportunity-api
+      OTEL_METRICS_EXPORTER: none
+      OTEL_LOGS_EXPORTER: none
     ports: ["8000:8000"]
     depends_on:
       postgres: {condition: service_healthy}
@@ -71,6 +84,10 @@ services:
     command: ["python", "-m", "opportunity_agent.v2.agents.a2a", "profile", "--host", "0.0.0.0", "--advertised-host", "profile", "--backend", "python"]
     environment:
       JIUWEN_BACKEND: python
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
+      OTEL_SERVICE_NAME: opportunity-profile
+      OTEL_METRICS_EXPORTER: none
+      OTEL_LOGS_EXPORTER: none
       LLM_API_KEY: ${LLM_API_KEY:-}
       LLM_API_BASE: ${LLM_API_BASE:-}
       LLM_MODEL: ${LLM_MODEL:-}
@@ -86,6 +103,10 @@ services:
     environment:
       <<: *research-budget
       JIUWEN_BACKEND: python
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
+      OTEL_SERVICE_NAME: opportunity-research
+      OTEL_METRICS_EXPORTER: none
+      OTEL_LOGS_EXPORTER: none
       DATABASE_URL: postgresql+asyncpg://opportunity:opportunity_dev_only@postgres:5432/opportunity_agent
       REDIS_URL: redis://redis:6379/0
       LLM_API_KEY: ${LLM_API_KEY:-}
@@ -114,6 +135,10 @@ services:
     command: ["python", "-m", "opportunity_agent.v2.agents.a2a", "planning", "--host", "0.0.0.0", "--advertised-host", "planning", "--backend", "python"]
     environment:
       JIUWEN_BACKEND: python
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
+      OTEL_SERVICE_NAME: opportunity-planning
+      OTEL_METRICS_EXPORTER: none
+      OTEL_LOGS_EXPORTER: none
       LLM_API_KEY: ${LLM_API_KEY:-}
       LLM_API_BASE: ${LLM_API_BASE:-}
       LLM_MODEL: ${LLM_MODEL:-}
@@ -130,6 +155,10 @@ services:
       DATABASE_URL: postgresql+asyncpg://opportunity:opportunity_dev_only@postgres:5432/opportunity_agent
       REDIS_URL: redis://redis:6379/0
       JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET to a long random secret}
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
+      OTEL_SERVICE_NAME: opportunity-worker
+      OTEL_METRICS_EXPORTER: none
+      OTEL_LOGS_EXPORTER: none
       LLM_API_KEY: ${LLM_API_KEY:-}
       LLM_API_BASE: ${LLM_API_BASE:-}
       LLM_MODEL: ${LLM_MODEL:-}

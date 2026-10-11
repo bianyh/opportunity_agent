@@ -161,10 +161,12 @@ def test_context_compression_keeps_exact_late_quotes():
     assert len(shortened)<=12000 and quote in shortened and shortened.startswith('CMU MSCS')
 
 
-def test_irrelevant_or_wrong_intake_page_never_calls_model():
+def test_irrelevant_or_wrong_intake_page_never_creates_evidence():
     class Model:
         enabled=True
-        def generate_structured(self,*a,**k):raise AssertionError('must prefilter')
+        def generate_structured(self,*a,**k):
+            from research_response_fixtures import structured
+            return structured(k['context'],[dict(field='gre_policy',value='optional',quote='GRE is optional.')])
     async def run():
         task=parse_task(SimpleNamespace(message='查询 CMU MSCS 2027 Fall GRE',request_id='q',missing_task=None,success_criteria=None))
         service=ResearchService(None,llm=Model())
@@ -172,7 +174,8 @@ def test_irrelevant_or_wrong_intake_page_never_calls_model():
         for text in ['MSCS Fall 2026 GRE is optional.','Master of Biostatistics Fall 2027 GRE optional.']:
             result=ResearchResult()
             await service._accept_page(task,result,target,{'url':'https://www.cmu.edu/admissions','title':text,'text':text})
-            assert result.diagnostics['web_rejections'][0]['precheck']
+            assert not result.programs
+            assert result.diagnostics['web_field_rejections']
     asyncio.run(run())
 
 

@@ -36,7 +36,7 @@ from opportunity_agent.v2.research.quality import field_supported
 
 
 PAGE = {"url": "https://msaii.cs.cmu.edu/apply-msaii-program", "title": "Apply to the MSAII Program",
-        "text": "MSAII Master of Science in Artificial Intelligence and Innovation. "
+        "text": "Master of Science in Artificial Intelligence and Innovation (MSAII). "
         "Entry in Fall 2027. The deadline to apply is December 9, 2026."}
 FACT = {"field": "deadline", "value": "2026-12-09", "quote": "The deadline to apply is December 9, 2026."}
 
@@ -234,7 +234,13 @@ def request(query="查询CMU MSAII 2027截止日期"):
 class Model:
     enabled = True
     def generate_structured(self, model, **kwargs):
-        return WebExtraction(university="CMU", program="MSAII", intake="Fall 2027", facts=[WebFact(**FACT)])
+        from research_response_fixtures import structured
+        result = structured(kwargs['context'],[WebFact(**FACT)])
+        for fact in result.facts:
+            fact.program = fact.program_quote = 'Master of Science in Artificial Intelligence and Innovation'
+            fact.degree = 'masters'
+            fact.date_text = 'December 9, 2026'
+        return result
 
 
 class Web:

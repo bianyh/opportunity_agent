@@ -44,7 +44,8 @@ class Model:
         return len(self.requests)
     def generate_structured(self, *args, **kwargs):
         self.requests.append(kwargs)
-        return WebExtraction(intake=self.intake, facts=[
+        from research_response_fixtures import structured
+        return structured(kwargs['context'], [
             WebFact(field="gre_policy", value=self.gre, quote=f"GRE is {self.gre.replace('_', ' ')}."),
             WebFact(field="deadline", value=self.deadline,
                 quote=self.quote or "Application deadline: January 15, 2027.")])
@@ -75,13 +76,13 @@ def test_no_intake_page_is_accepted_but_never_claims_explicit_cycle(parsed_intak
     asyncio.run(run())
 
 
-def test_explicit_wrong_cycle_is_still_rejected_before_model():
+def test_explicit_wrong_cycle_is_rejected_by_source_verifier():
     async def run():
         model, result = Model(), ResearchResult()
         await ResearchService(None, llm=model)._accept_page(task(), result,
             ProgramResult(university="Brown", program="MSCS", intake="2027 Fall"),
             page("MSCS admissions for Fall 2026. GRE is not required."))
-        assert model.calls == 0 and not result.programs
+        assert model.calls == 1 and not result.programs
     asyncio.run(run())
 
 
@@ -125,7 +126,7 @@ def test_cmu_msaii_named_query_accepts_facts_but_gre_filter_excludes_it():
         assert not program_matches(result.programs[0], SuccessCriteria(gre_policy="not_required"), task().as_of)
         wrong = ResearchResult()
         await service._accept_page(task(), wrong, target.model_copy(update={"program": "MSCS"}), official)
-        assert not wrong.programs and model.calls == 1
+        assert not wrong.programs and model.calls == 2
     asyncio.run(run())
 
 
@@ -140,7 +141,8 @@ def test_current_policy_survives_database_round_trip_and_gre_sql_filter():
                 ProgramResult(university="Brown", program="MSCS", intake="2027 Fall"), page())
             p = result.programs[0]
             facts = [{"field": f.field, "value": f.value, "qualifier": f.qualifier,
-                "quote": next(e.excerpt for e in p.evidence if e.evidence_id in f.evidence_ids)} for f in p.facts]
+                "quote": next(e.excerpt for e in p.evidence if e.evidence_id in f.evidence_ids),
+                "provenance": next(e.extraction_provenance for e in p.evidence if e.evidence_id in f.evidence_ids)} for f in p.facts]
             async with async_sessionmaker(engine, expire_on_commit=False)() as session:
                 await persist_verified_page(session, p, page(), facts)
                 await session.commit()

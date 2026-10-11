@@ -22,6 +22,8 @@ class ResearchEntities(BaseModel):
     model_config = ConfigDict(extra="forbid")
     university: str = ""
     program: str = ""
+    degree: Literal['', 'masters', 'doctoral', 'bachelors'] = ''
+    home_unit: str = ''
     intake: str = ""
     country: str = ""
     universities: list[str] = Field(default_factory=list)

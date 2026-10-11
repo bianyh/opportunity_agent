@@ -126,7 +126,8 @@ def classify_failure(exc, tool):
 
 class ResearchRepairPlanner:
     def __init__(self, llm=None):
-        self.llm = copy.copy(llm) if llm is not None else LLMClient(timeout_seconds=20, retries=0)
+        from .models import role_client
+        self.llm = copy.copy(llm) if llm is not None else role_client('repair', 20)
         self.llm.retries = 0
         self.llm.tls_compatibility_retry = False  # A TLS fallback is also a new network request.
         if llm is None and os.getenv("RESEARCH_REPAIR_MODEL"):

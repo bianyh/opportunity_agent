@@ -640,14 +640,18 @@ GRE policy, citation, or user preference. If research evidence is absent or a fi
 is unknown, say that it is unverified. For research facts, preserve source URLs from
 the supplied evidence as Markdown links when they are available; never fabricate a
 link. Do not cite a source that does not support the sentence immediately before it.
-For ResearchResult, use only verified facts with their own evidence_ids. Unknown,
+  For ResearchResult, use only verified facts with their own evidence_ids. Unknown,
 stale, conflicting, or relevance_passed=false evidence is not a verified fact.
 Each programme lists evidence_ids only; resolve them against research_result.evidence,
 which holds every evidence object exactly once.
 Evidence with temporal_scope=current_policy is a freshly read official policy, not
 confirmation of the requested admission cycle. It may be used, but explicitly label
 its intake as unconfirmed and retain exact source dates. Retrieval date alone never
-proves that a deadline or GRE policy applies to 2027 Fall. Do not infer missing years.
+  proves that a deadline or GRE policy applies to 2027 Fall. Do not infer missing years.
+  Exception for source-bound partial dates: an unknown deadline with evidence whose
+  extraction_provenance.year_status=unknown may be quoted as "the page lists [source
+  date], but the year/requested cycle is unconfirmed", with its citation. Never
+  convert it to an ISO date, infer this year, or present it as satisfying completion.
 Semantic relevance does not establish GRE or deadlines. Findings can answer a
 semantic question without a programme list. Reranker scores are not university rankings.
 If completion is PARTIAL, clearly state what was verified, what remains missing,

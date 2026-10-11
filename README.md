@@ -250,7 +250,7 @@ docker compose -f docker-compose.yml -f docker-compose.research.yml up -d --no-b
 2. 新建对话，发送下方样例；查看执行步骤、回复和 Run / Trace 标识。
 3. 核对并接受待确认的画像／规划变更；在“偏好”页查看和撤销已保存偏好。
 4. [FastAPI Docs](http://127.0.0.1:8000/docs) 提供接口说明，健康检查为 `/healthz`。
-5. GPU / OTel overlay 提供 [Jaeger](http://127.0.0.1:16686)，按 Trace ID 查看跨服务调用。
+5. 基础 Compose 已提供 [Jaeger](http://127.0.0.1:16686)，按 Trace ID 查看跨服务调用；API、三个 Agent 和 Worker 均配置 OTLP HTTP 导出。追踪数据默认保存在内存中，Jaeger 重启后不保留。
 
 Docker 模式**不需要宿主机再 pip 安装或执行 `run_v2_local.ps1`**。后者是 SQLite 本地开发入口，不是完整 Docker / pgvector 链路。
 
