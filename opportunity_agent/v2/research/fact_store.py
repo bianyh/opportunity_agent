@@ -14,7 +14,7 @@ from .normalization import supported_value
 from .task import intake_supported
 
 
-async def persist_verified_page(session, program, page, facts):
+async def persist_verified_page(session, program, page, facts, *, require_explicit_intake=True):
     """Write in the caller's short transaction; never commit unrelated work."""
     university, name, intake = program.university, program.program, normalize_intake(program.intake)
     url, title, body = page["url"], page["title"], page["text"]
@@ -25,8 +25,11 @@ async def persist_verified_page(session, program, page, facts):
             and parsed.port in {None, 443} and any(host == d or host.endswith("." + d) for d in record["domains"])):
         raise ValueError("Fact persistence requires a verified official HTTPS source")
     match, _, _ = classify_program_page(name, title, url, body)
-    if match != "exact" or not intake_supported(intake, body):
-        raise ValueError("Fact persistence requires exact programme and explicit intake")
+    intake_is_explicit = intake_supported(intake, body)
+    if match != "exact" or (require_explicit_intake and not intake_is_explicit):
+        raise ValueError("Official page persistence requires an exact programme and the requested intake scope")
+    if facts and not intake_is_explicit:
+        raise ValueError("Structured facts require an intake explicitly supported by the source")
     for fact in facts:
         if (fact["field"] not in {"deadline", "gre_policy", "tuition", "language"}
                 or not fact["quote"] or fact["quote"] not in body

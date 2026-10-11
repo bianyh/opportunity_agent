@@ -2,12 +2,15 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import html
 import json
 import os
 import re
 from contextlib import AsyncExitStack
 from datetime import timedelta
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, unquote, urljoin, urlparse
+from xml.etree import ElementTree
 
 import httpx
 
@@ -273,3 +276,405 @@ class TavilyMCP:
             if text.strip():
                 return {"url": returned, "title": str(item.get("title", "")), "text": text}
         raise RuntimeError("MCP extract returned no readable official content")
+
+
+class _SearchResultParser(_TextParser):
+    """Small HTML parser for public search-engine result pages.
+
+    Search results are only a URL discovery mechanism.  They never become
+    evidence: every returned URL is checked against the registered university
+    domains and fetched again by :class:`OfficialWeb.read`.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.links: list[tuple[str, str]] = []
+        self._href = ""
+        self._parts: list[str] = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "a":
+            self._href = dict(attrs).get("href") or ""
+            self._parts = []
+
+    def handle_data(self, data):
+        if self._href and data.strip():
+            self._parts.append(data.strip())
+
+    def handle_endtag(self, tag):
+        if tag == "a" and self._href:
+            title = re.sub(r"\s+", " ", " ".join(self._parts)).strip()
+            self.links.append((self._href, title))
+            self._href, self._parts = "", []
+
+
+class OfficialWeb:
+    """Direct, bounded retrieval from registered official university domains.
+
+    Tavily remains available as an optional accelerator, but the research path
+    must also work when no third-party search key is configured.  This adapter
+    discovers candidate URLs from robots/sitemaps and, when necessary, a
+    public search result page.  Only URLs under the supplied registered
+    domains are returned or read.
+    """
+
+    _DEFAULT_PATHS = (
+        "/admissions", "/graduate/admissions", "/graduate/programs",
+        "/programs", "/programs/admissions", "/apply", "/application",
+        "/application-requirements", "/deadlines", "/admission",
+    )
+
+    def __init__(self, *, search_limit=3, page_limit=8, timeout_seconds=7):
+        self.search_limit, self.page_limit = search_limit, page_limit
+        self.search_calls = self.page_calls = 0
+        self.timeout_seconds = max(3, int(timeout_seconds))
+        self.client: httpx.AsyncClient | None = None
+        self.registry = OfficialDomainRegistry()
+        self._sitemap_cache: dict[str, list[str]] = {}
+        self._robots_rules: dict[str, list[tuple[str, str]]] = {}
+
+    async def __aenter__(self):
+        self.client = httpx.AsyncClient(
+            timeout=httpx.Timeout(self.timeout_seconds, connect=min(6, self.timeout_seconds)),
+            follow_redirects=False,
+            headers={"User-Agent": "OpportunityAgentOfficialResearch/2.0", "Accept": "text/html,application/xml,text/plain,*/*"},
+        )
+        return self
+
+    async def __aexit__(self, *args):
+        if self.client is not None:
+            await self.client.aclose()
+            self.client = None
+        return False
+
+    @staticmethod
+    def _allowed(url, domains):
+        parsed = urlparse(url)
+        host = (parsed.hostname or "").casefold().rstrip(".")
+        return bool(parsed.scheme == "https" and not parsed.username and not parsed.password
+                    and parsed.port in {None, 443}
+                    and any(host == d or host.endswith("." + d) for d in domains))
+
+    async def _fetch(self, url, domains, *, max_bytes=2 * 1024 * 1024, soft=False):
+        if self.client is None:
+            raise RuntimeError("OfficialWeb must be used as an async context manager")
+        current = url
+        for _ in range(5):
+            if not self._allowed(current, domains):
+                raise ValueError("URL left verified official domains")
+            host = (urlparse(current).hostname or "").casefold()
+            await asyncio.to_thread(_assert_public_host, host)
+            try:
+                response = await self.client.get(current)
+                if response.is_redirect:
+                    current = urljoin(current, response.headers.get("location", ""))
+                    continue
+                response.raise_for_status()
+                if int(response.headers.get("content-length") or 0) > max_bytes:
+                    raise ValueError("Official response exceeds 2 MiB")
+                body = await response.aread()
+                if len(body) > max_bytes:
+                    raise ValueError("Official response exceeds 2 MiB")
+                return current, response.headers.get("content-type", ""), bytes(body)
+            except Exception:
+                if soft:
+                    return None
+                raise
+        raise ValueError("Too many official page redirects")
+
+    @staticmethod
+    def _candidate_roots(domains, query=""):
+        """Build a small set of likely official subdomains under each root."""
+        lowered = query.casefold()
+        labels = []
+        if re.search(r"\b(?:mscs|mcs|cse|computer|cs)\b|计算机", lowered):
+            labels = ["www.csd", "www.cs", "www.eecs", "www.ece"]
+        if re.search(r"\b(?:msaii|ai|artificial|intelligence|machine|ml)\b|人工智能|机器学习", lowered):
+            labels = ["msaii.cs", "www.lti", "www.cs", "ai", "ml", *labels]
+        if not labels:
+            labels = ["www.gradschool", "www.graduate", "www.admissions"]
+        roots = []
+        for domain in domains:
+            # Prefer the canonical www host for redirects such as cs.cmu.edu
+            # -> www.cs.cmu.edu; the alias can still be probed after it.
+            roots.append(f"https://www.{domain}")
+            roots.append(f"https://{domain}")
+            roots.extend(f"https://{label}.{domain}" for label in labels)
+        return list(dict.fromkeys(roots))[:12]
+
+    async def _sitemap_urls(self, domains, query=""):
+        """Read a few robots/sitemap documents without spending page budget."""
+        cache_key = "|".join((*domains, query.casefold().strip()))
+        if cache_key in self._sitemap_cache:
+            return self._sitemap_cache[cache_key]
+        probes = []
+        for root in self._candidate_roots(domains, query):
+            domain = next((item for item in domains if urlparse(root).hostname == item
+                           or urlparse(root).hostname.endswith("." + item)), domains[0])
+            probes.extend([(domain, "robots", root + "/robots.txt"),
+                           (domain, "sitemap", root + "/sitemap.xml")])
+            if urlparse(root).hostname not in {domain, "www." + domain}:
+                probes.append((domain, "home", root + "/"))
+        fetched_probes = await asyncio.gather(*(
+            self._fetch(url, domains, max_bytes=512 * 1024 if kind == "robots" else 4 * 1024 * 1024, soft=True)
+            for _, kind, url in probes), return_exceptions=True)
+        sitemap_urls: list[str] = []
+        linked_pages: list[str] = []
+        for (domain, kind, _), fetched in zip(probes, fetched_probes, strict=True):
+            if not fetched or isinstance(fetched, BaseException):
+                continue
+            if kind == "robots":
+                text = _decode_html(fetched[2], fetched[1])
+                sitemap_urls.extend(re.findall(r"(?im)^\s*sitemap:\s*(\S+)", text))
+                self._robots_rules[domain] = self._parse_robots(text)
+            elif kind == "sitemap":
+                sitemap_urls.append(fetched[0])
+            else:
+                parser = _SearchResultParser()
+                parser.feed(_decode_html(fetched[2], fetched[1]))
+                for href, _ in parser.links:
+                    candidate = urljoin(fetched[0], html.unescape(href))
+                    if self._allowed(candidate, domains) and self._robots_allowed(candidate):
+                        linked_pages.append(candidate)
+        if not sitemap_urls:
+            sitemap_urls.extend(f"https://{domain}{path}" for domain in domains
+                                for path in ("/sitemap_index.xml", "/sitemap-index.xml"))
+        pending = list(dict.fromkeys(u for u in sitemap_urls if self._allowed(u, domains)))
+        seen, pages = set(), []
+        while pending and len(seen) < 4 and len(pages) < 250:
+            batch = []
+            while pending and len(batch) < 4 and len(seen) < 8:
+                sitemap = pending.pop(0)
+                if sitemap not in seen:
+                    seen.add(sitemap)
+                    batch.append(sitemap)
+            fetched_batch = await asyncio.gather(*(
+                self._fetch(sitemap, domains, max_bytes=4 * 1024 * 1024, soft=True)
+                for sitemap in batch), return_exceptions=True)
+            for fetched in fetched_batch:
+                if not fetched or isinstance(fetched, BaseException):
+                    continue
+                try:
+                    root = ElementTree.fromstring(fetched[2])
+                except ElementTree.ParseError:
+                    continue
+                tag = root.tag.rsplit("}", 1)[-1].casefold()
+                locs = [str(item.text or "").strip() for item in root.iter()
+                        if item.tag.rsplit("}", 1)[-1].casefold() == "loc" and item.text]
+                if tag == "sitemapindex":
+                    pending.extend(item for item in locs if self._allowed(item, domains) and item not in seen)
+                else:
+                    pages.extend(item for item in locs if self._allowed(item, domains))
+        # Follow a few high-scoring official HTML pages one hop. University
+        # program pages are often hosted on a department subdomain and linked
+        # from a central school page rather than listed in the root sitemap.
+        deep_seeds = self._rank(linked_pages, query)[:2]
+        deep_fetched = await asyncio.gather(*(
+            self._fetch(url, domains, max_bytes=2 * 1024 * 1024, soft=True)
+            for url in deep_seeds), return_exceptions=True)
+        deep_links = []
+        for fetched in deep_fetched:
+            if not fetched or isinstance(fetched, BaseException):
+                continue
+            parser = _SearchResultParser()
+            parser.feed(_decode_html(fetched[2], fetched[1]))
+            for href, _ in parser.links:
+                candidate = urljoin(fetched[0], html.unescape(href))
+                if self._allowed(candidate, domains) and self._robots_allowed(candidate):
+                    deep_links.append(candidate)
+        result = list(dict.fromkeys([*pages, *linked_pages, *deep_links]))
+        result = [url for url in result if self._robots_allowed(url)][:500]
+        self._sitemap_cache[cache_key] = result
+        return result
+
+    @staticmethod
+    def _parse_robots(text):
+        groups, agents, rules = [], [], []
+        for raw in text.splitlines():
+            line = raw.split("#", 1)[0].strip()
+            if ":" not in line:
+                continue
+            key, value = (part.strip() for part in line.split(":", 1))
+            key, value = key.casefold(), value.strip()
+            if key == "user-agent":
+                if rules:
+                    groups.append((agents, rules))
+                    agents, rules = [], []
+                agents.append(value.casefold())
+            elif key in {"allow", "disallow"} and agents and value:
+                rules.append((key, value))
+        if agents:
+            groups.append((agents, rules))
+        chosen = [rule for group_agents, group_rules in groups
+                  if "*" in group_agents or any("opportunityagent" in agent for agent in group_agents)
+                  for rule in group_rules]
+        return chosen
+
+    def _robots_allowed(self, url):
+        host = (urlparse(url).hostname or "").casefold().rstrip(".")
+        path = urlparse(url).path or "/"
+        matching = [(domain, rules) for domain, rules in self._robots_rules.items()
+                    if host == domain or host.endswith("." + domain)]
+        if not matching:
+            return True
+        rules = max(matching, key=lambda item: len(item[0]))[1]
+        applicable = [(kind, rule) for kind, rule in rules if path.startswith(rule)]
+        if not applicable:
+            return True
+        kind, _ = max(applicable, key=lambda item: (len(item[1]), item[0] == "allow"))
+        return kind != "disallow"
+
+    @staticmethod
+    def _query_terms(query):
+        terms = set(re.findall(r"[a-z0-9]{2,}|[\u4e00-\u9fff]", query.casefold()))
+        expansions = {
+            "mscs": {"master", "science", "computer", "computer-science", "cs", "graduate"},
+            "mcs": {"master", "science", "computer", "computer-science", "cs", "graduate"},
+            "cse": {"computer", "science", "engineering", "graduate"},
+            "msaii": {"master", "artificial", "intelligence", "innovation", "ai"},
+            "msml": {"master", "machine", "learning", "graduate"},
+        }
+        for key, values in expansions.items():
+            if key in terms:
+                terms.update(values)
+        return terms
+
+    def _rank(self, urls, query):
+        terms = self._query_terms(query)
+        scored = []
+        for url in dict.fromkeys(urls):
+            parsed = urlparse(url)
+            text = (unquote(parsed.netloc + " " + parsed.path).casefold()
+                    .replace("-", " ").replace("_", " ").replace("/", " "))
+            score = sum(2.0 for term in terms if term in text)
+            score += sum(1.5 for marker in ("admission", "application", "deadline", "requirement", "program", "degree", "graduate") if marker in text)
+            score += sum(3.0 for marker in ("education master", "education masters", "education graduate admissions", "apply", "requirements") if marker in text)
+            score -= 2.0 * sum(1 for marker in ("news", "event", "calendar", "directory", "faculty", "people", "athletics") if marker in text)
+            if any(marker in text for marker in ("cs.cmu", "computer-science", "computer science", "mscs", "mcs")):
+                score += 4
+            if parsed.netloc.casefold().startswith("www.cs.") and "graduate admissions" in text:
+                score += 2
+            if (parsed.netloc.casefold().startswith("www.cs.")
+                    and parsed.path.casefold().rstrip("/") == "/education/graduate-admissions"):
+                score += 10
+            if "csd" in text and re.search(r"\b(?:mscs|mcs|cse|computer|cs)\b", query.casefold()):
+                score += 8
+            if "education master index" in text and re.search(r"\b(?:mscs|mcs|cse)\b", query.casefold()):
+                score += 5
+            if "lti" in text and re.search(r"\bmsaii\b|artificial intelligence", query.casefold()):
+                score += 5
+            if "msaii" in text and re.search(r"\bmsaii\b", query.casefold()):
+                score += 12
+            if any(marker in text for marker in ("ai.cmu", "msaii", "artificial-intelligence")):
+                score += 4
+            if parsed.netloc.casefold().startswith("www."):
+                score += 1.5
+            elif parsed.netloc.casefold().split(".", 1)[0] in {"cs", "eecs", "ece"}:
+                score -= 1.5
+            scored.append((score, len(text), url))
+        scored.sort(key=lambda item: (-item[0], item[1], item[2]))
+        # Department aliases commonly redirect to the same canonical page.
+        # Keep one URL per path so the bounded reader spends its page budget
+        # on different official pages, especially a central admissions page
+        # that may carry the requested intake year.
+        result, seen_paths = [], set()
+        for _, _, url in scored:
+            path = (urlparse(url).path or "/").rstrip("/").casefold() or "/"
+            if path in seen_paths:
+                continue
+            seen_paths.add(path)
+            result.append(url)
+        return result
+
+    async def _search_engine(self, query, domains):
+        if self.client is None:
+            return []
+        site = " OR ".join("site:" + domain for domain in domains)
+        search_query = f"{site} {query} admissions program deadline requirements"
+        custom_endpoint = os.getenv("OFFICIAL_SEARCH_URL")
+        if not custom_endpoint:
+            return []
+        endpoints = [custom_endpoint]
+        for endpoint in endpoints:
+            params = {"q": search_query, "num": "10", "hl": "en"}
+            try:
+                async with asyncio.timeout(3):
+                    response = await self.client.get(endpoint, params=params, headers={"Accept": "text/html"})
+                response.raise_for_status()
+                parser = _SearchResultParser()
+                parser.feed(response.text)
+            except Exception:
+                continue
+            found = []
+            for href, title in parser.links:
+                # Google often wraps links in /url?q=...; never trust the
+                # wrapper and validate the unwrapped URL against the registry.
+                if href.startswith("/url?"):
+                    href = parse_qs(urlparse(href).query).get("q", [""])[0]
+                href = html.unescape(href)
+                bing = urlparse(href)
+                if bing.path.casefold() == "/ck/a":
+                    encoded = parse_qs(bing.query).get("u", [""])[0]
+                    if encoded.startswith("a1"):
+                        try:
+                            href = base64.urlsafe_b64decode(encoded[2:] + "=" * ((4 - len(encoded[2:]) % 4) % 4)).decode()
+                        except (ValueError, UnicodeDecodeError):
+                            href = ""
+                if self._allowed(href, domains) and self._robots_allowed(href):
+                    found.append((href, title))
+            if found:
+                return found
+        return []
+
+    async def search(self, query, domains=()):
+        if self.search_calls >= self.search_limit:
+            raise RuntimeError("Research search budget exhausted")
+        self.search_calls += 1
+        domains = tuple(str(d).casefold().rstrip(".") for d in domains)
+        if not domains:
+            return {"results": [], "diagnostic": "no_registered_domain"}
+        sitemap_pages = await self._sitemap_urls(domains, query)
+        search_pages = await self._search_engine(query, domains)
+        urls = [item[0] for item in search_pages] + sitemap_pages
+        paths = list(self._DEFAULT_PATHS) + [
+            "/education/graduate-admissions",
+            "/education/graduate-studies/admissions",
+            "/graduate-admissions", "/graduate/admissions",
+        ]
+        if re.search(r"\bmsaii\b", query.casefold()):
+            paths.extend(["/apply-msaii-program", "/about-msaii-program", "/curriculum"])
+        if re.search(r"\b(?:mscs|mcs|cse)\b", query.casefold()):
+            paths.extend(["/education/master/index.html", "/education/masters/index.html",
+                          "/academics/masters/ms-in-computer-science"])
+        if re.search(r"\bmsaii\b", query.casefold()):
+            paths.extend(["/academics/masters-programs/msaii.html"])
+        for root in self._candidate_roots(domains, query):
+            urls.extend(urljoin(root + "/", path.lstrip("/")) for path in paths)
+        ranked = self._rank(urls, query)
+        ranked = [url for url in ranked if self._robots_allowed(url)]
+        title_by_url = {url: title for url, title in search_pages}
+        return {"results": [{"url": url, "title": title_by_url.get(url, ""), "content": "official URL candidate"}
+                             for url in ranked[:max(5, min(12, self.page_limit * 2))]],
+                "diagnostic": {"sitemap_candidates": len(sitemap_pages), "search_candidates": len(search_pages)}}
+
+    async def read(self, url, domains):
+        if self.page_calls >= self.page_limit:
+            raise RuntimeError("Research page budget exhausted")
+        if not self._robots_allowed(url):
+            raise ValueError("robots.txt disallows this official URL")
+        self.page_calls += 1
+        final_url, content_type, body = await self._fetch(url, domains)
+        if "pdf" in content_type.casefold() or final_url.casefold().endswith(".pdf"):
+            raise ValueError("PDF official pages are not supported by the HTML reader")
+        html_text = _decode_html(body, content_type)
+        parser = ResearchTextParser()
+        parser.feed(html_text)
+        text = parser.get_text()
+        if not text.strip():
+            text = re.sub(r"\s+", " ", html.unescape(html_text)).strip()
+        if len(text.strip()) < 80:
+            raise ValueError("Official page has no readable text")
+        return {"url": final_url, "title": _page_title(html_text) or final_url, "text": text[:200000]}
+
+    async def extract(self, url, domains):
+        return await self.read(url, domains)

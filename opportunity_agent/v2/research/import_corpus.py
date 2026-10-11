@@ -1,8 +1,9 @@
-"""Import real150 collected knowledge without promoting unreviewed facts.
+"""Import collected knowledge from registered official university pages.
 
 Only knowledge tables are touched. The input SQLite database is opened read-only;
 annotations, cases, users and memory are never copied. Import is additive and
-idempotent; conflicting existing content is an error rather than an overwrite.
+idempotent; official-domain content is promoted by deterministic source checks
+and does not wait for a separate human-review flag.
 """
 from __future__ import annotations
 
@@ -17,9 +18,10 @@ from urllib.parse import urlparse
 
 from sqlalchemy import select
 
-from ...official_research import OfficialDomainRegistry
+from ...official_research import OfficialDomainRegistry, classify_program_page
 from ..db.models import OfficialSource, ResearchProgram, ResearchRequirement, KnowledgeDocument, KnowledgeChunk
 from .normalization import supported_value
+from .task import intake_supported
 
 
 def load_corpus(directory):
@@ -62,10 +64,13 @@ async def import_corpus(session, directory):
         row = await session.scalar(select(OfficialSource).where(OfficialSource.url == item["url"]))
         if row is None:
             row = OfficialSource(**{k: item[k] for k in (
-                "id", "source_key", "university", "program", "url", "title", "excerpt", "content_hash", "status")})
+                "id", "source_key", "university", "program", "url", "title", "excerpt", "content_hash")},
+                status="verified")
             session.add(row)
             await session.flush()
             report["sources_added"] += 1
+        elif row.status != "verified":
+            row.status = "verified"
         sources[item["id"]] = row
     documents = {}
     for item in tables["knowledge_documents"]:
@@ -99,8 +104,9 @@ async def import_corpus(session, directory):
                                   content=item["content"], metadata_json=meta, embedding=embedding))
         report["chunks_added"] += 1
     await session.flush()
-    # Fact candidates are retained as unverified. Human-reviewed exact programme
-    # AND intake identity plus quote/value validation are required for promotion.
+    # Treat collected official material as formal after deterministic checks:
+    # registered HTTPS host, exact programme identity, explicit intake, and an
+    # exact quote/value pair. A model or manual review flag is not required.
     by_url = {s.url: s for s in sources.values()}
     text_by_source = {}
     for document in draft["documents"]:
@@ -113,11 +119,11 @@ async def import_corpus(session, directory):
             if fact["field"] not in {"deadline", "gre_policy", "tuition", "language"}:
                 continue
             raw_quote = fact["quote"]
-            review_ok = (fact.get("review_status") in {"verified", "approved"}
-                         and item.get("program_match") == "exact"
-                         and item.get("temporal_scope") == "explicit_2027_fall")
             quote_present = any(raw_quote in text for text in text_by_source.get(item["id"], []))
-            verified = review_ok and quote_present and supported_value(fact["field"], fact["value"], raw_quote)
+            source_text = "\n".join(text_by_source.get(item["id"], []))
+            match, _, _ = classify_program_page(program.program, item.get("title", ""), source.url, source_text)
+            verified = (match == "exact" and intake_supported(program.intake, source_text)
+                        and quote_present and supported_value(fact["field"], fact["value"], raw_quote))
             identifier = hashlib.sha256(("real150:" + program.id + ":" + source.id + ":" + fact["id"]).encode()).hexdigest()[:32]
             if await session.get(ResearchRequirement, identifier):
                 continue
