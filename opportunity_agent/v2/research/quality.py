@@ -39,16 +39,9 @@ def field_supported(program: ProgramResult, field: str, criteria: SuccessCriteri
         if field == "gre_policy":
             return fact.value == program.gre_policy
         return True
-
-    # Deadline and GRE policy are school/programme-level facts independent of project specialization.
-    # They can be sourced from generic admissions pages (not just exact programme pages).
-    # Other fields (tuition, curriculum, etc.) require exact programme match.
-    min_program_match = "generic" if field in {"deadline", "gre_policy"} else "exact"
-
     return any(f.verification_status == "verified" and any(
         eid in evidence and field in evidence[eid].supports_fields
-        and (evidence[eid].program_match == "exact" or
-             (min_program_match == "generic" and evidence[eid].program_match in {"exact", "generic"}))
+        and evidence[eid].program_match == "exact"
         and intake_bound(program, evidence[eid])
         and usable(evidence[eid], criteria, as_of)
         for eid in f.evidence_ids) and matches_scalar(f) for f in observations)

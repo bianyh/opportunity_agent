@@ -31,7 +31,7 @@ async def persist_verified_page(session, program, page, facts):
     for fact in facts:
         if (fact["field"] not in {"deadline", "gre_policy", "tuition", "language"}
                 or not fact["quote"] or fact["quote"] not in body
-                or not supported_value(fact["field"], fact["value"], fact["quote"])):
+                or not supported_value(fact["field"], fact["value"], fact["quote"], intake)):
             raise ValueError("Fact does not match its source quote")
         if fact["field"] == "deadline" and expired_current_deadline(fact["value"], intake, date.today()):
             raise ValueError("A past deadline cannot represent a current application cycle")

@@ -83,6 +83,7 @@ def run_failure_report(state):
     ledger = diagnostics.get("tool_execution", {})
     recovered = sum(1 for call in ledger.get("calls", []) if call.get("status") == "failed") if status == "PASS" else 0
     return {"status": status, "has_issues": active, "summary": labels.get(status, ""),
+        "unverified_candidates": unverified_candidates(diagnostics),
         "issues": list(grouped.values())[:20] if active else [],
         "extraction_timeout_seconds": round(extraction_seconds, 3),
         "completion_reasons": list(completion.get("reasons", []))[:10] if active else [],
@@ -90,6 +91,48 @@ def run_failure_report(state):
         "circuit_open": "extraction_service_unavailable" in grouped,
         "tool_usage": {k: ledger[k] for k in ("tools_used", "tool_limit", "decisions_used", "decision_limit") if k in ledger},
         "recovered_failures": recovered}
+
+
+def unverified_candidates(diagnostics):
+    """Expose candidates separately from evidence, including legacy Run calls."""
+    from .repair import safe_url
+    from urllib.parse import urlsplit
+    rows = []
+    for current in [diagnostics, *diagnostics.get("rounds", [])]:
+        if not isinstance(current, dict):
+            continue
+        rows.extend(current.get("unverified_candidates", []))
+        rows.extend({**r, "reason": r.get("error_code", "PROGRAM_MISMATCH")}
+                    for r in current.get("web_rejections", []) if isinstance(r, dict) and r.get("url"))
+    calls = diagnostics.get("tool_execution", {}).get("calls", [])
+    pages = {c.get("data", {}).get("page_ref"): c for c in calls
+             if c.get("tool") in {"read_official_page", "extract_official_page"} and c.get("status") == "ok"}
+    for call in calls:
+        if call.get("error_code") not in {"PROGRAM_MISMATCH", "INTAKE_UNSUPPORTED"}:
+            continue
+        page = pages.get(call.get("arguments", {}).get("page_ref"))
+        if page:
+            target = diagnostics.get("web_progress", {}).get(call.get("target_id"), {})
+            rows.append({**target, "url": page.get("data", {}).get("url", ""),
+                         "reason": call["error_code"]})
+    output, seen = [], set()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        url = safe_url(str(row.get("url", "")))
+        if urlsplit(url).scheme != "https" or not urlsplit(url).hostname:
+            continue
+        key = (url, row.get("program", ""))
+        if key in seen:
+            continue
+        seen.add(key)
+        reason = row.get("reason")
+        output.append({"title": str(row.get("title") or url)[:200], "url": url,
+            "university": str(row.get("university", ""))[:180],
+            "program": str(row.get("program", ""))[:180], "counted": False,
+            "label": "可能不匹配（未计入合格结果）",
+            "reason": "页面入学季与目标不符" if reason == "INTAKE_UNSUPPORTED" else "未确认属于目标项目"})
+    return output[:20]
 
 
 def failure_summary(result):

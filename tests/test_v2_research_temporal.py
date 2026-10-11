@@ -23,6 +23,8 @@ from opportunity_agent.v2.rag.retrieval import RetrievalHit
 def config(monkeypatch):
     monkeypatch.setenv("RESEARCH_PERSIST_FACTS", "0")
     monkeypatch.setenv("RESEARCH_QUEUE_INGEST", "0")
+    # Model-path temporal gates; keyword extraction is covered in test_v2_deadline_extraction.
+    monkeypatch.setenv("RESEARCH_KEYWORD_EXTRACTION", "0")
 
 
 def task():

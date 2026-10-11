@@ -64,11 +64,16 @@ async function check(){
   assert.ok(ui.steps.textContent.includes('搜索官网 · CMU · MSCS · 项目 1/5'));
   completionCode='PARTIAL';failureReport={has_issues:true,status:'PARTIAL',summary:'部分完成，查询条件尚未满足',
     extraction_timeout_seconds:91.735,missing_fields:['deadline','gre_policy'],completion_reasons:['尚未得到证据'],
+    unverified_candidates:[{title:'数学学院 <img src=x>',url:'https://math.gatech.edu/admissions',university:'GT',reason:'未确认属于目标项目'},
+      {title:'恶意链接',url:'javascript:alert(1)',reason:'未确认'}],
     issues:[{message:'模型字段提取超时',count:3,schools:['Brown','<img src=x onerror=alert(1)>']}]};
   third.handlers.run_diagnostics({data:JSON.stringify({payload:failureReport})});
   assert.equal(document.getElementById('run-diagnostics').hidden,false);
   assert.ok(document.getElementById('run-diagnostics').innerHTML.includes('91.7 秒'));
   assert.ok(!document.getElementById('run-diagnostics').innerHTML.includes('<img'));
+  assert.ok(document.getElementById('run-diagnostics').innerHTML.includes('可能不匹配（未计入合格结果）'));
+  assert.ok(document.getElementById('run-diagnostics').innerHTML.includes('href="https://math.gatech.edu/admissions"'));
+  assert.ok(!document.getElementById('run-diagnostics').innerHTML.includes('href="javascript:'));
   third.handlers.answer_snapshot({data:JSON.stringify({sequence:2,payload:{text:'第一段'}})});
   third.handlers.answer_snapshot({data:JSON.stringify({sequence:2,payload:{text:'重放旧事件'}})});
   assert.equal(ui.messages.children.length,count+1);

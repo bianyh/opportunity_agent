@@ -302,6 +302,7 @@ def test_multiple_intake_years_use_explicit_product_default(monkeypatch):
 def test_mcp_body_verification_and_field_specific_freshness(monkeypatch, only_gre, expected):
     from opportunity_agent.v2.research.service import WebExtraction, WebFact
     monkeypatch.setenv("RESEARCH_QUEUE_INGEST", "0")
+    monkeypatch.setenv("RESEARCH_KEYWORD_EXTRACTION", "0")  # tests the model's field coverage
     class Web:
         search_calls = page_calls = 0
         search_limit, page_limit = 2, 5

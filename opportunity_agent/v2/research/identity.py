@@ -19,6 +19,10 @@ _PROGRAM_ALIASES = {
 
 
 def program_aliases(name):
+    if name.strip().casefold() in {"cse", "ms cse"}:
+        # CSE can mean Computational Science and Engineering, among others.
+        # Preserve the query; official pages establish its school-local meaning.
+        return (name.strip(),)
     for aliases in _PROGRAM_ALIASES.values():
         if name.strip().casefold() in {a.casefold() for a in aliases}:
             return aliases

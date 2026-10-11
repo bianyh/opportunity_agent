@@ -36,6 +36,9 @@ def repair_config(monkeypatch):
     monkeypatch.setenv("RESEARCH_TOOL_REPAIR_ENABLED", "1")
     monkeypatch.setenv("RESEARCH_PERSIST_FACTS", "0")
     monkeypatch.setenv("RESEARCH_PROGRESS_ENABLED", "0")
+    # These tests exercise the model-extraction repair path; the deterministic
+    # keyword pass would otherwise resolve their fixture pages without the model.
+    monkeypatch.setenv("RESEARCH_KEYWORD_EXTRACTION", "0")
     monkeypatch.delenv("RESEARCH_PER_SCHOOL_SECONDS", raising=False)
 
 

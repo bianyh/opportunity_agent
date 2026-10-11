@@ -178,6 +178,12 @@ class BoundedWebRunner:
                 # Only construct HTTPS candidates; the reader must still validate DNS and redirects.
                 url = urlunsplit(("https", p.netloc.lower(), p.path, p.query, ""))
                 match, _, _ = classify_program_page(self.target.program, str(item.get("title", "")), url, str(item.get("content", ""))[:1000])
+                if self.target.program and match != "exact":
+                    self.result.diagnostics.setdefault("unverified_candidates", []).append({
+                        "university": self.target.university, "program": self.target.program,
+                        "title": str(item.get("title", ""))[:200], "url": safe_url(url),
+                        "program_match": match, "reason": "PROGRAM_MISMATCH", "stage": "search",
+                        "counted": False})
                 if self.target.program and match == "rejected":
                     continue
                 score = (2 if match == "exact" else 0) + int(bool(re.search(r"admission|graduate|master|deadline|apply", url, re.I)))
@@ -315,7 +321,15 @@ class BoundedWebRunner:
                    and o.get("arguments", {}).get("profile") == args.profile and set(o.get("arguments", {}).get("fields", [])) == set(args.fields)
                    for o in self.ledger.state.get("calls", [])):
                 raise ToolFailure("UNCHANGED_EXTRACTION_RETRY")
-            await self.ledger.circuit(self.channel, "check", minimum_remaining=remaining)
+            # An open model circuit only disables the model; the deterministic
+            # keyword pass in _accept_page still runs and raises if it finds nothing.
+            llm_blocked = ""
+            try:
+                await self.ledger.circuit(self.channel, "check", minimum_remaining=remaining)
+            except ToolFailure as exc:
+                if exc.code != "EXTRACTION_CIRCUIT_OPEN":
+                    raise
+                llm_blocked = exc.code
         call_id = await self.ledger.reserve(self.school, tool=tool, signature=signature, retry=tool != "extract_program_facts",
             extraction_key=self.target_id + args.page_ref if tool == "extract_program_facts" else "")
         if tool in {"read_official_page", "extract_official_page"}:
@@ -356,7 +370,8 @@ class BoundedWebRunner:
                         self.service._page_deadline = asyncio.get_running_loop().time() + remaining
                         before = len(self.result.diagnostics.get("extraction_attempts", []))
                         try:
-                            await self.service._accept_page(task, self.result, self.target, self.pages[args.page_ref], profile=args.profile)
+                            await self.service._accept_page(task, self.result, self.target, self.pages[args.page_ref],
+                                                            profile=args.profile, llm_blocked=llm_blocked)
                         finally:
                             attempts = self.result.diagnostics.get("extraction_attempts", [])
                             if len(attempts) > before and any(a.get("status") == "ok" for a in attempts[-1]["attempts"]):
@@ -418,8 +433,12 @@ class BoundedWebRunner:
         if action.tool == "validate_official_url":
             return RepairDecision(action="call_tool", tool="read_official_page", arguments=ToolArguments(url=action.arguments.url))
         if action.tool in {"read_official_page", "extract_official_page"}:
+            ref = observation.data["page_ref"]
+            if any(o.tool == "extract_program_facts" and o.arguments.get("page_ref") == ref for o in self.observations):
+                # A different URL redirected to a page already extracted; move on.
+                return self.next_candidate()
             return RepairDecision(action="call_tool", tool="extract_program_facts",
-                arguments=ToolArguments(page_ref=observation.data["page_ref"], fields=self.task.requested_fields))
+                arguments=ToolArguments(page_ref=ref, fields=self.task.requested_fields))
 
     async def repair(self, observation):
         if self.stop:
@@ -580,6 +599,7 @@ class BoundedWebRunner:
             if url:
                 return RepairDecision(action="call_tool", tool="extract_official_page", arguments=ToolArguments(url=url))
         if observation.error_code in {"PROGRAM_MISMATCH", "INTAKE_UNSUPPORTED", "NO_SUPPORTED_FACTS", "MISSING_FIELDS",
+                "EXTRACTION_CIRCUIT_OPEN",
                 "OFFICIAL_DOMAIN_REJECTED", "PRIVATE_ADDRESS_REJECTED", "TLS_REJECTED", "PORT_REJECTED"}:
             return self.next_candidate()
         return None

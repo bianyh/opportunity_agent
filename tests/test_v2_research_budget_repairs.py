@@ -118,7 +118,8 @@ def test_chinese_cs_scope_filters_out_ece_in_sql():
     asyncio.run(run())
 
 
-def test_first_school_extraction_timeout_does_not_abort_second_school():
+def test_first_school_extraction_timeout_does_not_abort_second_school(monkeypatch):
+    monkeypatch.setenv("RESEARCH_KEYWORD_EXTRACTION", "0")  # force the model path for Brown
     class Model:
         enabled = True
         def generate_structured(self, *args, **kwargs):

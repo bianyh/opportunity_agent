@@ -1,223 +1,177 @@
-"""Tests for improved deadline extraction and source identity matching."""
+"""Deterministic deadline/GRE extraction: one date grammar, intake-cycle years."""
 import pytest
-from datetime import date
-from opportunity_agent.v2.research.normalization import supported_value, _extract_dates_from_text
-from opportunity_agent.v2.research.quality import field_supported
-from opportunity_agent.v2.agents.contracts import ProgramResult, Evidence, ResearchFact, SuccessCriteria
+
+from opportunity_agent.official_research import classify_program_page
+from opportunity_agent.v2.research.normalization import (
+    _extract_dates_from_text, date_mentions, keyword_facts, supported_value)
+
+# Excerpts of the live pages behind the failing runs (2026-10).
+GATECH = ("Admission Requirements Applicants to the MSCS program are evaluated holistically. "
+          "Effective January 2026, the TOEFL scale will change to 1-6, and our new requirement will be 5.0. "
+          "A GRE score is not required for admission to the MSCS program. "
+          "The application deadline is Feb. 1 for admission to the following fall semester. "
+          "© 2026 Georgia Institute of Technology")
+UCSD_MDS = ("Program Start Dates and Application Deadlines Winter 2027 Application Opens: August 12, 2026 "
+            "Final Deadline/Close: November 4, 2026 Program Starts: January, 4, 2027 Fall 2027 Application "
+            "Opens: August 12, 2026 Final Deadline/Close: July 28, 2027 Program Starts: September 20, 2027. "
+            "Is the GRE required to apply for this program? No, the GRE exam is not required to apply to the "
+            "Master of Data Science program.")
 
 
-class TestDatetimeExtraction:
-    """Verify multi-format date extraction."""
-
-    def test_short_format_with_year_in_context(self):
-        """Feb. 1 without explicit year should extract with context year.
-
-        If context_year is provided and Feb 1 of that year hasn't passed yet,
-        use it. Otherwise, infer next year.
-        """
-        quote = "The application deadline is Feb. 1 for admission to the following fall semester."
-
-        # If explicitly provided 2025 and Feb 1 2025 hasn't passed, use 2025
-        candidates = _extract_dates_from_text(quote, context_year=2025)
-        # Note: Today is 2026-10-10, so Feb 1 2025 is already passed
-        # The function should return 2026-02-01 (next year)
-        assert any("2026-02-01" in c for c in candidates), f"Expected Feb 1 2026 in {candidates}"
-
-    def test_iso_format(self):
-        """ISO format YYYY-MM-DD."""
-        quote = "Application deadline: 2025-02-01"
-        candidates = _extract_dates_from_text(quote)
-        assert "2025-02-01" in candidates
-
-    def test_full_english_format(self):
-        """Full English format like 'February 1, 2025'."""
-        quote = "The final deadline is February 1, 2025 for Fall admission."
-        candidates = _extract_dates_from_text(quote)
-        assert "2025-02-01" in candidates
-
-    def test_abbreviated_english_format(self):
-        """Abbreviated English format like 'Feb 1, 2025'."""
-        quote = "Submission closes Feb 1, 2025."
-        candidates = _extract_dates_from_text(quote)
-        assert "2025-02-01" in candidates
-
-    def test_numeric_format(self):
-        """Numeric format like 2/1/2025."""
-        quote = "Deadline is 2/1/2025"
-        candidates = _extract_dates_from_text(quote)
-        assert "2025-02-01" in candidates
-
-    def test_chinese_format(self):
-        """Chinese date format YYYY年M月D日."""
-        quote = "申请截止日期是 2025年2月1日"
-        candidates = _extract_dates_from_text(quote)
-        assert "2025-02-01" in candidates
+@pytest.mark.parametrize("text,intake,expected", [
+    ("Application deadline: 2027-01-15", "", "2027-01-15"),
+    ("Deadline: February 1, 2027", "", "2027-02-01"),
+    ("Deadline: Feb. 1st, 2027", "", "2027-02-01"),
+    ("Deadline: 1 February 2027", "", "2027-02-01"),
+    ("Deadline: 2/1/2027", "", "2027-02-01"),
+    ("申请截止日期：2027年2月1日", "", "2027-02-01"),
+    # Year-less dates resolve from the requested cycle, not today or a copyright year.
+    ("The deadline is Feb. 1.", "2027 Fall", "2027-02-01"),
+    ("The deadline is December 15.", "2027 Fall", "2026-12-15"),
+    ("The deadline is 15 January.", "2027 Fall", "2027-01-15"),
+    ("The deadline is October 1.", "2027 Spring", "2026-10-01"),
+    ("截止日期为12月15日", "2027 Fall", "2026-12-15"),
+])
+def test_date_grammar(text, intake, expected):
+    assert _extract_dates_from_text(text, intake) == [expected]
 
 
-class TestSupportedValueDeadline:
-    """Verify deadline validation accepts extracted dates."""
-
-    def test_deadline_with_short_format_and_context(self):
-        """Deadline extracted from 'Feb. 1' with context year inference should validate."""
-        # Georgia Tech case: page has "© 2026" and "Effective January 2026"
-        # but Feb 1 2026 is past (today is 2026-10-10), so should infer 2027
-        quote = "Application deadline: Feb. 1 for admission to Fall semester. © 2026 Georgia Institute of Technology"
-        value = "2027-02-01"  # Inferred from context
-        result = supported_value("deadline", value, quote)
-        assert result is True, f"Deadline validation failed for {value} in quote"
-
-    def test_deadline_explicit_future_year(self):
-        """When year is explicitly stated as future, use that year."""
-        quote = "Application deadline: Feb. 1, 2028 for Fall admission"
-        value = "2028-02-01"
-        result = supported_value("deadline", value, quote)
-        assert result is True
-
-    def test_deadline_requires_deadline_keyword(self):
-        """Quote must contain deadline/due/closes keyword."""
-        quote = "Feb. 1 is when students enroll"  # No deadline keyword
-        value = "2027-02-01"
-        result = supported_value("deadline", value, quote)
-        assert result is False, "Should reject date without deadline keyword"
-
-    def test_deadline_with_iso_format(self):
-        """ISO deadline format."""
-        quote = "Application deadline: 2025-02-01"
-        value = "2025-02-01"
-        result = supported_value("deadline", value, quote)
-        assert result is True
-
-    def test_deadline_rejects_wrong_date(self):
-        """Wrong date should be rejected."""
-        quote = "Application deadline: Feb. 1, 2025"
-        value = "2025-03-01"  # Wrong month
-        result = supported_value("deadline", value, quote)
-        assert result is False
+def test_yearless_date_needs_a_season():
+    # A year-only intake cannot decide whether "Dec. 15" is in 2026 or 2027.
+    assert date_mentions("Deadline: Dec. 15", "2027")[0][2] is None
+    assert date_mentions("Deadline: Dec. 15", "")[0][2] is None
 
 
-class TestGenericSourceDeadlineAcceptance:
-    """Verify deadline/GRE can be sourced from generic (non-exact) programme pages."""
-
-    def test_deadline_from_generic_page(self):
-        """Deadline should be accepted from generic university-wide admissions page."""
-        evidence = Evidence(
-            evidence_id="test-1",
-            source_id="source-1",
-            url="https://example.edu/admissions",
-            authority="official",
-            program_match="generic",  # Not exact
-            intake="2025 Fall",
-            supports_fields=["deadline"],
-            relevance_score=0.8,  # Required for legacy relevance_method to pass usable()
-        )
-
-        program = ProgramResult(
-            university="Example University",
-            program="Master of Science in Computer Science",
-            intake="2025 Fall",
-            deadline=date(2025, 2, 1),
-            evidence=[evidence],
-            facts=[
-                ResearchFact(
-                    field="deadline",
-                    value="2025-02-01",
-                    verification_status="verified",
-                    evidence_ids=["test-1"],
-                )
-            ],
-        )
-
-        criteria = SuccessCriteria(accepted_authorities=["official"])
-        result = field_supported(program, "deadline", criteria)
-        assert result is True, "Deadline from generic source should be accepted"
-
-    def test_gre_from_generic_page(self):
-        """GRE policy should be accepted from generic page."""
-        evidence = Evidence(
-            evidence_id="test-2",
-            source_id="source-2",
-            url="https://example.edu/requirements",
-            authority="official",
-            program_match="generic",  # Not exact
-            intake="2025 Fall",
-            supports_fields=["gre_policy"],
-            relevance_score=0.8,  # Required for legacy relevance_method to pass usable()
-        )
-
-        program = ProgramResult(
-            university="Example University",
-            program="Master of Science in Computer Science",
-            intake="2025 Fall",
-            gre_policy="not_required",
-            evidence=[evidence],
-            facts=[
-                ResearchFact(
-                    field="gre_policy",
-                    value="not_required",
-                    verification_status="verified",
-                    evidence_ids=["test-2"],
-                )
-            ],
-        )
-
-        criteria = SuccessCriteria(accepted_authorities=["official"])
-        result = field_supported(program, "gre_policy", criteria)
-        assert result is True, "GRE policy from generic source should be accepted"
-
-    def test_tuition_still_requires_exact(self):
-        """Other fields (tuition) should still require exact programme match."""
-        evidence = Evidence(
-            evidence_id="test-3",
-            source_id="source-3",
-            url="https://example.edu/admissions",
-            authority="official",
-            program_match="generic",  # Not exact
-            intake="2025 Fall",
-            supports_fields=["tuition"],
-            verification_status="verified",
-        )
-
-        program = ProgramResult(
-            university="Example University",
-            program="Master of Science in Computer Science",
-            intake="2025 Fall",
-            evidence=[evidence],
-            facts=[
-                ResearchFact(
-                    field="tuition",
-                    value="50000",
-                    verification_status="verified",
-                    evidence_ids=["test-3"],
-                )
-            ],
-        )
-
-        criteria = SuccessCriteria(accepted_authorities=["official"])
-        result = field_supported(program, "tuition", criteria)
-        assert result is False, "Tuition should require exact programme match"
+def test_words_are_not_dates():
+    assert _extract_dates_from_text("Documents may be submitted by email in March 2027.", "2027 Fall") == []
 
 
-class TestUCSDMSCSEIdentity:
-    """Verify MSCSE identity handling.
-
-    Note: MSCSE support depends on entries in _PROGRAM_IDENTITIES.
-    This test verifies that when MSCSE is properly registered, pages
-    claiming DS identity should not match an MSCSE request.
-    """
-
-    def test_mscse_vs_mscs_distinction(self):
-        """MSCSE page should not match MSCS program request."""
-        from opportunity_agent.official_research import classify_program_page
-
-        # Page that clearly mentions "Data Science" instead of CSE
-        title = "Master of Data Science - Admissions"
-        url = "https://mds.ucsd.edu/admissions/index.html"
-        text = "The MS in Data Science is a highly interactive program. Data science combines..."
-
-        match, scope, evidence = classify_program_page("Master of Science in Computer Science and Engineering", title, url, text)
-        # Should be rejected or generic, not exact for MSCSE when page says DS
-        assert match in {"generic", "rejected"}, f"Expected generic/rejected for DS page when looking for MSCSE, got {match}"
+def test_supported_value_binds_yearless_quote_to_intake():
+    quote = "The application deadline is Feb. 1 for admission to the following fall semester."
+    assert supported_value("deadline", "2027-02-01", quote, "2027 Fall")
+    assert not supported_value("deadline", "2026-02-01", quote, "2027 Fall")
+    assert not supported_value("deadline", "2027-02-01", quote)  # no cycle, no guess
+    assert not supported_value("deadline", "2027-02-01", "Classes start Feb. 1.", "2027 Fall")
 
 
-if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
+def test_gre_policy_classification():
+    assert supported_value("gre_policy", "not_required", "The GRE is no longer required.")
+    assert not supported_value("gre_policy", "required", "The GRE is no longer required.")
+    assert not supported_value("gre_policy", "required", "Progress reports are required.")
+
+
+def test_keyword_facts_gatech():
+    facts = {f["field"]: f for f in keyword_facts(GATECH, ["deadline", "gre_policy"], "2027 Fall")}
+    assert facts["deadline"]["value"] == "2027-02-01"
+    assert facts["gre_policy"]["value"] == "not_required"
+    for fact in facts.values():
+        assert fact["quote"] in GATECH  # exact substring, required for evidence
+
+
+def test_keyword_facts_skip_questions_and_ambiguity():
+    facts = {f["field"]: f["value"] for f in keyword_facts(UCSD_MDS, ["deadline", "gre_policy"], "2027 Fall")}
+    # The question "Is the GRE required…?" must not count as a 'required' statement.
+    assert facts.get("gre_policy") == "not_required"
+    # Winter and Fall deadlines share one run-on block: left for the model, not guessed.
+    assert "deadline" not in facts
+
+
+def test_keyword_facts_prefer_regular_over_priority():
+    text = "Priority deadline: December 1, 2026. Final application deadline: January 15, 2027."
+    assert keyword_facts(text, ["deadline"], "2027 Fall") == [
+        {"field": "deadline", "value": "2027-01-15", "quote": "Final application deadline: January 15, 2027."}]
+
+
+def test_keyword_facts_conflicting_regular_deadlines_defer_to_model():
+    text = "Domestic applicants: deadline January 15, 2027. International applicants: deadline December 15, 2026."
+    assert keyword_facts(text, ["deadline"], "2027 Fall") == []
+
+
+def test_keyword_facts_ignore_other_degrees_and_cycles():
+    text = ("PhD applications are due December 1, 2026. The MS application deadline is February 1, 2027. "
+            "Spring 2027 applications close October 1, 2026.")
+    assert [f["value"] for f in keyword_facts(text, ["deadline"], "2027 Fall")] == ["2027-02-01"]
+
+
+class NoModel:
+    """Fails the test if the model is called; keyword pass must cover the fields."""
+    enabled = True
+    def generate_structured(self, *args, **kwargs):
+        raise AssertionError("model must not be called")
+
+
+def _accept(page_text, fields=("deadline", "gre_policy"), llm=None, **kwargs):
+    import asyncio
+    from datetime import date
+    from types import SimpleNamespace
+    from opportunity_agent.v2.agents.contracts import ProgramResult, ResearchResult, SuccessCriteria
+    from opportunity_agent.v2.research.service import ResearchService
+    from opportunity_agent.v2.research.task import parse_task
+    task = parse_task(SimpleNamespace(message="Georgia Tech MSCS 2027 Fall GRE 和截止日期",
+                                      success_criteria=SuccessCriteria(), missing_task=None))
+    task.as_of, task.requested_fields = date(2026, 10, 10), list(fields)
+    result = ResearchResult()
+    target = ProgramResult(university="Georgia Institute of Technology",
+                           program="Master of Science in Computer Science", intake="2027 Fall")
+    page = {"url": "https://www.cc.gatech.edu/ms-computer-science-admission-requirements",
+            "title": "MS Computer Science Admission Requirements", "text": page_text}
+    asyncio.run(ResearchService(None, llm=llm or NoModel())._accept_page(task, result, target, page, **kwargs))
+    return result
+
+
+@pytest.fixture
+def no_persist(monkeypatch):
+    monkeypatch.setenv("RESEARCH_PERSIST_FACTS", "0")
+    monkeypatch.setenv("RESEARCH_QUEUE_INGEST", "0")
+    monkeypatch.setenv("RESEARCH_KEYWORD_EXTRACTION", "1")
+
+
+def test_accept_page_keyword_path_skips_model(no_persist):
+    from datetime import date
+    result = _accept(GATECH)
+    program = result.programs[0]
+    assert program.deadline == date(2027, 2, 1) and program.gre_policy == "not_required"
+    assert not result.diagnostics.get("extraction_attempts")
+    assert all(e.temporal_scope == "current_policy" for e in program.evidence)
+
+
+def test_accept_page_keyword_path_runs_with_open_circuit(no_persist):
+    from opportunity_agent.v2.research.repair import ToolFailure
+    result = _accept(GATECH, llm_blocked="EXTRACTION_CIRCUIT_OPEN")
+    assert result.programs[0].gre_policy == "not_required"
+    with pytest.raises(ToolFailure, match="EXTRACTION_CIRCUIT_OPEN"):
+        import opportunity_agent.v2.research.service as service_module
+        service = service_module.ResearchService(None, llm=NoModel())
+        service._repair_active = True
+        import asyncio
+        from types import SimpleNamespace
+        from opportunity_agent.v2.agents.contracts import ProgramResult, ResearchResult, SuccessCriteria
+        from opportunity_agent.v2.research.task import parse_task
+        task = parse_task(SimpleNamespace(message="Georgia Tech MSCS 2027 Fall GRE", success_criteria=SuccessCriteria(), missing_task=None))
+        task.requested_fields = ["deadline", "gre_policy"]
+        asyncio.run(service._accept_page(task, ResearchResult(),
+            ProgramResult(university="Georgia Institute of Technology", program="Master of Science in Computer Science", intake="2027 Fall"),
+            {"url": "https://www.cc.gatech.edu/x", "title": "MS Computer Science", "text": "MSCS program overview."},
+            llm_blocked="EXTRACTION_CIRCUIT_OPEN"))
+
+
+def test_accept_page_keyword_path_rejects_expired_and_wrong_cycle(no_persist):
+    expired = _accept("MSCS. The application deadline is January 15, 2026. GRE is not required.", llm=None)
+    assert expired.programs[0].deadline is None
+    assert any(r["reason"] == "expired_deadline" for r in expired.diagnostics["web_field_rejections"])
+    wrong = _accept("MSCS admissions for Fall 2026. The deadline is Feb. 1. GRE is not required.")
+    assert not wrong.programs  # explicit other cycle is rejected before any extraction
+
+
+def test_data_science_page_is_not_cse():
+    match, _, _ = classify_program_page(
+        "Master of Science in Computer Science and Engineering", "Admissions",
+        "https://mds.ucsd.edu/admissions/index.html",
+        "Degree Type: Master of Data Science. Computer Science and Engineering department news. " + UCSD_MDS)
+    assert match == "rejected"
+
+
+def test_mscs_page_still_exact():
+    match, _, _ = classify_program_page("Master of Science in Computer Science", "MS Computer Science Admission Requirements",
+        "https://www.cc.gatech.edu/ms-computer-science-admission-requirements", GATECH)
+    assert match == "exact"

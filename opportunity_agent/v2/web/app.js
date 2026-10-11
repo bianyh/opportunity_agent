@@ -139,15 +139,24 @@
       (run.status==='completed'?'已完成':'正在处理'));}
   function showRunDiagnostics(id,report){
     const target=$('run-diagnostics');
-    if(!report?.has_issues&&!report?.recovered_failures){target.hidden=true;target.innerHTML='';return;}
+    if(!report?.has_issues&&!report?.recovered_failures&&!report?.unverified_candidates?.length){target.hidden=true;target.innerHTML='';return;}
     const issues=(report.issues||[]).map(item=>`<li>${escape(item.message)} · ${Number(item.count)||0} 次`+
       (item.schools?.length?' · '+escape(item.schools.join('、')):'')+'</li>').join('');
     const reasons=(report.completion_reasons||[]).map(reason=>`<li>${escape(reason)}</li>`).join('');
+    const candidates=(report.unverified_candidates||[]).map(item=>{
+      let link=escape(item.title||item.url||'候选页面');
+      try { const url=new URL(item.url); if(url.protocol==='https:'&&!url.username&&!url.password)
+        link=`<a href="${escape(url.href)}" target="_blank" rel="noopener noreferrer">${link}</a>`;
+      } catch (_) {}
+      return `<li>${link} · ${escape(item.university||'')} · 可能不匹配（未计入合格结果）`+
+        ` · ${escape(item.reason||'项目身份未确认')}</li>`;
+    }).join('');
     target.innerHTML=`<details open><summary>${escape(report.summary||(report.recovered_failures?'查询已完成，工具异常已处理':'执行诊断'))}</summary><ul>${issues}${reasons}</ul>`+
       (report.recovered_failures?`<p>过程中发生 ${Number(report.recovered_failures)||0} 次工具异常，最终查询条件已满足。</p>`:'')+
       (report.tool_usage?.tool_limit?`<p>工具调用：${Number(report.tool_usage.tools_used)||0}/${Number(report.tool_usage.tool_limit)||0}；修复决策：${Number(report.tool_usage.decisions_used)||0}/${Number(report.tool_usage.decision_limit)||0}</p>`:'')+
       (report.extraction_timeout_seconds?`<p>模型提取超时累计：${Number(report.extraction_timeout_seconds).toFixed(1)} 秒</p>`:'')+
       (report.missing_fields?.length?`<p>仍缺少：${escape(report.missing_fields.map(x=>({deadline:'申请截止日期',gre_policy:'GRE 政策'}[x]||x)).join('、'))}</p>`:'')+
+      (candidates?`<h4>未确认匹配的搜索结果</h4><ul>${candidates}</ul><p>这些页面仅供核对，不作为答案证据或合格项目。</p>`:'')+
       `<small>Run：${escape(id||'')}</small></details>`;
     target.hidden=false;
   }
