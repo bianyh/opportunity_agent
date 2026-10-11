@@ -88,7 +88,9 @@ class ResearchTextParser(_TextParser):
         if self._is_main_root(tag, attrs):
             self._main_roots.append(tag)
             self.has_main_content = True
-        if tag in self._BLOCK_TAGS:
+        if tag in {"td", "th"}:
+            self._append(" | ")
+        elif tag in self._BLOCK_TAGS:
             self._boundary()
         if tag in {"h1", "h2", "h3", "h4", "h5", "h6"}:
             self.heading, self.heading_parts = int(tag[1]), []
@@ -111,7 +113,7 @@ class ResearchTextParser(_TextParser):
         if self.heading and tag == "h" + str(self.heading):
             self._append("#" * self.heading + " " + " ".join(self.heading_parts).strip())
             self.heading = None
-        if tag in self._BLOCK_TAGS:
+        if tag in self._BLOCK_TAGS and tag not in {"td", "th"}:
             self._boundary()
         for index in range(len(self._main_roots) - 1, -1, -1):
             if self._main_roots[index] == tag:
@@ -160,9 +162,12 @@ class TavilyMCP:
     def __init__(self, *, search_limit=2, page_limit=5):
         self.search_limit, self.page_limit = search_limit, page_limit
         self.search_calls = self.page_calls = 0
+        self.request_timeout_seconds = 20.
+        self.request_deadline = None
         self.session = None
         self.stack = AsyncExitStack()
         self.tools = {}
+        self.on_progress = None
         self.registry = OfficialDomainRegistry()
 
     async def __aenter__(self):
@@ -198,7 +203,14 @@ class TavilyMCP:
         with span("mcp.search" if name == "tavily_search" else "mcp.extract", tool=name):
             # Use the MCP SDK's request timeout. Wrapping call_tool in asyncio.wait_for
             # cancels its AnyIO task group and can poison later calls in the session.
-            response = await self.session.call_tool(actual, arguments, read_timeout_seconds=timedelta(seconds=20))
+            timeout = max(.01, min(20, self.request_timeout_seconds))
+            if self.request_deadline is not None:
+                remaining = self.request_deadline - asyncio.get_running_loop().time()
+                if remaining <= .02:
+                    raise TimeoutError("MCP stage budget exhausted")
+                timeout = min(timeout, remaining - .01)
+            response = await self.session.call_tool(actual, arguments,
+                read_timeout_seconds=timedelta(seconds=timeout))
         if response.isError:
             raise RuntimeError("MCP tool returned an error")
         if getattr(response, "structuredContent", None):
@@ -214,15 +226,58 @@ class TavilyMCP:
                                                   "max_results": 5, "search_depth": "basic"})
 
     async def read(self, url, domains):
+        try:
+            return await self._read_direct(url, domains)
+        except (httpx.TransportError, httpx.HTTPStatusError) as exc:
+            # Never bypass HTTPS/domain/SSRF/content-size/redirect validation.
+            # Certificate failures also remain fatal rather than being hidden.
+            if "CERTIFICATE_VERIFY_FAILED" in str(exc):
+                raise
+            if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code not in {403, 429, 502, 503, 504}:
+                raise
+            if os.getenv("RESEARCH_READ_FALLBACK", "1") != "1" or "tavily_extract" not in self.tools:
+                raise
+            if self.on_progress:
+                await self.on_progress("read_fallback")
+            # The original attempt already consumed this page allowance.
+            return await self.extract(url, domains, consume_page=False)
+
+    async def validate_url(self, url, domains):
+        from .repair import ToolFailure
+        try:
+            parsed = urlparse(url)
+            host = (parsed.hostname or "").casefold()
+            port = parsed.port
+        except ValueError:
+            raise ToolFailure("INVALID_URL") from None
+        if parsed.username or parsed.password:
+            raise ToolFailure("URL_CREDENTIALS_REJECTED")
+        if not any(host == d or host.endswith("." + d) for d in domains):
+            raise ToolFailure("OFFICIAL_DOMAIN_REJECTED")
+        if parsed.scheme != "https":
+            raise ToolFailure("HTTPS_REQUIRED")
+        if port not in {None, 443}:
+            raise ToolFailure("PORT_REJECTED")
+        try:
+            await asyncio.to_thread(_assert_public_host, host)
+        except ValueError:
+            raise ToolFailure("PRIVATE_ADDRESS_REJECTED") from None
+        return {"valid": True}
+
+    async def _read_direct(self, url, domains, *, precise_errors=False, allow_body_fallback=True):
         if self.page_calls >= self.page_limit:
             raise RuntimeError("Research page budget exhausted")
         self.page_calls += 1
         # Validate every redirect ourselves; search snippets never become evidence.
-        async with httpx.AsyncClient(timeout=12, follow_redirects=False) as client:
+        proxy = os.getenv("RESEARCH_WEB_PROXY") or None
+        async with httpx.AsyncClient(timeout=httpx.Timeout(12, connect=6), proxy=proxy,
+                follow_redirects=False, headers={"User-Agent": "Mozilla/5.0 (compatible; OpportunityResearch/2.2)"}) as client:
             current = url
             for _ in range(6):
                 parsed = urlparse(current)
                 host = (parsed.hostname or "").casefold()
+                if precise_errors:
+                    await self.validate_url(current, domains)
                 if parsed.scheme != "https" or parsed.username or parsed.password or parsed.port not in {None, 443} or not any(host == d or host.endswith("." + d) for d in domains):
                     raise ValueError("Page left verified official domains")
                 await asyncio.to_thread(_assert_public_host, host)
@@ -241,40 +296,46 @@ class TavilyMCP:
                     parser.feed(html)
                     text = parser.get_text()
                     # Only after validating final URL; never fall back around a validation failure.
-                    if (len(text.strip()) < 100 and not (parser.has_main_content and text.strip())
+                    if (allow_body_fallback and len(text.strip()) < 100 and not (parser.has_main_content and text.strip())
                             and "tavily_extract" in self.tools):
                         data = await self._call("tavily_extract", {"urls": [current], "format": "text", "extract_depth": "basic"})
                         for item in data.get("results", []):
                             if item.get("url") == current:
                                 text = item.get("raw_content", "")[:200000]
-                    return {"url": current, "title": _page_title(html), "text": text}
+                    return {"url": current, "title": _page_title(html), "text": text, "read_method": "direct"}
             raise ValueError("Too many official page redirects")
 
-    async def extract(self, url, domains):
+    async def extract(self, url, domains, *, consume_page=True, precise_errors=False):
         """MCP extraction fallback for official pages that reject a direct reader."""
         if "tavily_extract" not in self.tools:
             raise RuntimeError("MCP server did not offer tavily_extract")
-        if self.page_calls >= self.page_limit:
+        if consume_page and self.page_calls >= self.page_limit:
             raise RuntimeError("Research page budget exhausted")
         parsed = urlparse(url)
+        if precise_errors:
+            await self.validate_url(url, domains)
         host = (parsed.hostname or "").casefold()
         if (parsed.scheme != "https" or parsed.username or parsed.password or parsed.port not in {None, 443}
                 or not any(host == domain or host.endswith("." + domain) for domain in domains)):
             raise ValueError("Extract URL left verified official domains")
         await asyncio.to_thread(_assert_public_host, host)
-        self.page_calls += 1
+        if consume_page:
+            self.page_calls += 1
         data = await self._call("tavily_extract", {"urls": [url], "format": "text", "extract_depth": "basic"})
         for item in data.get("results", []):
-            returned = item.get("url", url)
+            returned = item.get("url", "")
+            if precise_errors:
+                await self.validate_url(returned, domains)
             returned_parsed = urlparse(returned)
             returned_host = (returned_parsed.hostname or "").casefold()
             if (returned_parsed.scheme != "https" or returned_parsed.username or returned_parsed.password
                     or returned_parsed.port not in {None, 443}
                     or not any(returned_host == domain or returned_host.endswith("." + domain) for domain in domains)):
                 continue
+            await asyncio.to_thread(_assert_public_host, returned_host)
             text = str(item.get("raw_content", ""))[:200000]
             if text.strip():
-                return {"url": returned, "title": str(item.get("title", "")), "text": text}
+                return {"url": returned, "title": str(item.get("title", "")), "text": text, "read_method": "mcp_extract"}
         raise RuntimeError("MCP extract returned no readable official content")
 
 
@@ -328,6 +389,9 @@ class OfficialWeb:
         self.search_limit, self.page_limit = search_limit, page_limit
         self.search_calls = self.page_calls = 0
         self.timeout_seconds = max(3, int(timeout_seconds))
+        self.request_timeout_seconds = float(self.timeout_seconds)
+        self.request_deadline = None
+        self.on_progress = None
         self.client: httpx.AsyncClient | None = None
         self.registry = OfficialDomainRegistry()
         self._sitemap_cache: dict[str, list[str]] = {}
@@ -657,9 +721,33 @@ class OfficialWeb:
                              for url in ranked[:max(5, min(12, self.page_limit * 2))]],
                 "diagnostic": {"sitemap_candidates": len(sitemap_pages), "search_candidates": len(search_pages)}}
 
-    async def read(self, url, domains):
+    async def validate_url(self, url, domains):
+        from .repair import ToolFailure
+        try:
+            parsed = urlparse(url)
+            host = (parsed.hostname or "").casefold()
+            port = parsed.port
+        except ValueError:
+            raise ToolFailure("INVALID_URL") from None
+        if parsed.username or parsed.password:
+            raise ToolFailure("URL_CREDENTIALS_REJECTED")
+        if not any(host == d or host.endswith("." + d) for d in domains):
+            raise ToolFailure("OFFICIAL_DOMAIN_REJECTED")
+        if parsed.scheme != "https":
+            raise ToolFailure("HTTPS_REQUIRED")
+        if port not in {None, 443}:
+            raise ToolFailure("PORT_REJECTED")
+        try:
+            await asyncio.to_thread(_assert_public_host, host)
+        except ValueError:
+            raise ToolFailure("PRIVATE_ADDRESS_REJECTED") from None
+        return {"valid": True}
+
+    async def _read_direct(self, url, domains, *, precise_errors=False, allow_body_fallback=True):
         if self.page_calls >= self.page_limit:
             raise RuntimeError("Research page budget exhausted")
+        if precise_errors:
+            await self.validate_url(url, domains)
         if not self._robots_allowed(url):
             raise ValueError("robots.txt disallows this official URL")
         self.page_calls += 1
@@ -674,7 +762,13 @@ class OfficialWeb:
             text = re.sub(r"\s+", " ", html.unescape(html_text)).strip()
         if len(text.strip()) < 80:
             raise ValueError("Official page has no readable text")
-        return {"url": final_url, "title": _page_title(html_text) or final_url, "text": text[:200000]}
+        return {"url": final_url, "title": _page_title(html_text) or final_url,
+                "text": text[:200000], "read_method": "direct_official"}
 
-    async def extract(self, url, domains):
-        return await self.read(url, domains)
+    async def read(self, url, domains):
+        return await self._read_direct(url, domains)
+
+    async def extract(self, url, domains, *, consume_page=True, precise_errors=False):
+        if not consume_page:
+            self.page_calls = max(0, self.page_calls - 1)
+        return await self._read_direct(url, domains, precise_errors=precise_errors)

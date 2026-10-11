@@ -32,6 +32,7 @@
       <div id="messages" class="messages" aria-live="polite"></div>
         <div id="run-steps" class="run-steps" aria-live="polite"></div>
         <div id="run-info" class="hint" aria-live="polite"></div>
+        <div id="run-diagnostics" class="run-diagnostics" hidden></div>
       <form id="chat-form" class="composer"><textarea id="chat-input" rows="2" placeholder="说说你的背景、申请进展，或让助手生成计划…" required></textarea><button class="primary" type="submit">发送</button></form>
     </main>
 
@@ -47,6 +48,6 @@
   <dialog id="profile-dialog"><form id="profile-form"><h2>编辑画像</h2><div id="profile-fields" class="field-grid"></div><p class="hint">保存后请在待确认中审阅变更。</p><div class="dialog-actions"><button type="button" id="profile-cancel">取消</button><button class="primary" type="submit">保存</button></div></form></dialog>
   <dialog id="conflict-dialog" aria-labelledby="conflict-title"><h2 id="conflict-title">确认画像信息</h2><p class="hint">新信息与当前画像不同。选择后直接保存，无需在聊天中回复 A/B。</p><p id="conflict-error" role="alert" hidden></p><div id="conflict-items"></div><button id="conflict-later">稍后处理</button></dialog>
   <div id="toast" class="toast" role="status" hidden></div>
-  <script src="/v2/assets/app.js?v=router-20261008" defer></script>
+  <script src="/v2/assets/app.js?v=tool-repair-20261010" defer></script>
 </body>
 </html>

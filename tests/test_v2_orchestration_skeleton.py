@@ -63,7 +63,8 @@ def test_direct_reply_skips_domain_agents_and_completion_checker():
     assert agents.calls == []
     assert result.completion is None
     assert result.answer
-    assert [event.type for event in result.events] == ["run_started", "goal_parsed", "route_selected", "final_answer"]
+    assert [event.type for event in result.events] == ["run_started", "goal_parse_started", "goal_parsed",
+        "routing_started", "route_selected", "synthesis_started", "final_answer"]
 
 
 def test_llm_router_returns_validated_decision_instead_of_keyword_route():

@@ -222,6 +222,7 @@ class ResearchRequirement(UUIDPrimaryKey, Timestamped, Base):
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     status: Mapped[str] = mapped_column(String(32), default="verified")
     program_match: Mapped[str] = mapped_column(String(32), default="unknown")
+    extraction_provenance: Mapped[dict] = mapped_column(JSON, default=dict)
 
 
 class KnowledgeDocument(UUIDPrimaryKey, Timestamped, Base):

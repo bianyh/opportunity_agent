@@ -247,7 +247,8 @@ def test_web_merges_pages_for_same_year_only_target(monkeypatch):
     class Model:
         enabled = True
         def generate_structured(self, *args, **kwargs):
-            return WebExtraction(intake="2027 Fall", facts=[WebFact(
+            from research_response_fixtures import structured
+            return structured(kwargs['context'], [WebFact(
                 field="gre_policy", value="optional", quote="GRE is optional.")])
     async def run():
         monkeypatch.setenv("RESEARCH_QUEUE_INGEST", "0")

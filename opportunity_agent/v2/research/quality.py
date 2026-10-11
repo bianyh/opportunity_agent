@@ -19,6 +19,12 @@ def usable(e: Evidence, criteria: SuccessCriteria, as_of: date | None = None) ->
     return e.relevance_score is not None and e.relevance_score >= criteria.minimum_relevance_score
 
 
+def intake_bound(program: ProgramResult, evidence: Evidence) -> bool:
+    if evidence.temporal_scope == "current_policy":
+        return not evidence.intake and evidence.retrieved_at is not None and evidence.expires_at is not None
+    return evidence.intake.casefold() == program.intake.casefold()
+
+
 def field_supported(program: ProgramResult, field: str, criteria: SuccessCriteria, as_of=None) -> bool:
     # Old serialized runs remain readable, but newly built results must bind fields.
     if not program.facts and not program.program_id:
@@ -36,7 +42,7 @@ def field_supported(program: ProgramResult, field: str, criteria: SuccessCriteri
     return any(f.verification_status == "verified" and any(
         eid in evidence and field in evidence[eid].supports_fields
         and evidence[eid].program_match == "exact"
-        and evidence[eid].intake.casefold() == program.intake.casefold()
+        and intake_bound(program, evidence[eid])
         and usable(evidence[eid], criteria, as_of)
         for eid in f.evidence_ids) and matches_scalar(f) for f in observations)
 

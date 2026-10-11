@@ -99,8 +99,11 @@
     ui.conversations.innerHTML=state.conversations.map(item=>`<button class="conversation ${item.id===state.conversationId?'active':''}" data-conversation="${escape(item.id)}" title="${escape(item.title)}">${escape(item.title)}</button>`).join('');
   }
   async function openConversation(id) {
+    if(state.activeFollow)state.activeFollow.cancel();
     state.conversationId=id; renderConversations(); ui.messages.innerHTML=''; ui.steps.textContent=''; $('run-info').textContent='';
+    showRunDiagnostics(null,null);
     const item=await request('/conversations/'+encodeURIComponent(id));
+    if(state.conversationId!==id)return;
     $('conversation-title').textContent=item.title;
     item.messages.forEach(row=>{
       appendMessage(row.role,row.content);
@@ -108,10 +111,54 @@
         const info=document.createElement('div');info.className='hint';
         info.innerHTML=`Run：<a href="/api/v1/runs/${encodeURIComponent(row.run_id)}" target="_blank" rel="noopener">${escape(row.run_id)}</a> · ${escape(row.run_status||'')}`;
         ui.messages.lastElementChild.append(info);
+        const inspect=document.createElement('button');inspect.type='button';inspect.textContent='执行诊断';
+        inspect.onclick=async()=>{try{const run=await request('/runs/'+encodeURIComponent(row.run_id));
+          if(state.conversationId===id){showRunInfo(row.run_id,run.trace_id);showRunDiagnostics(row.run_id,run.failure_report);}}
+          catch(error){toast(error.message);}};
+        info.append(inspect);
         showRunInfo(row.run_id,row.trace_id);
       }
       if(row.role==='user'&&row.run_status==='failed')showRunFailure(row.run_id,row.run_error,row.content);
     });
+    const active=[...item.messages].reverse().find(row=>row.role==='user'&&['queued','running'].includes(row.run_status));
+    if(active&&state.conversationId===id){
+      const run=await request('/runs/'+encodeURIComponent(active.run_id));
+      if(state.conversationId!==id)return;
+      state.running=true;$('chat-form').querySelector('button').disabled=true;
+      followRun(active.run_id,active.content,id,run).catch(error=>toast(error.message));
+    } else if(!active){
+      const last=[...item.messages].reverse().find(row=>row.role==='user'&&row.run_id);
+      if(last){try{const run=await request('/runs/'+encodeURIComponent(last.run_id));
+        if(state.conversationId===id){showRunDiagnostics(last.run_id,run.failure_report);
+          $('run-status').textContent=runLabel(run);}}
+        catch(error){ /* Historical answers remain readable when diagnostics are unavailable. */ }}
+    }
+  }
+  function runLabel(run){return run.status==='failed'?'执行失败':
+    ({PARTIAL:'部分完成',NEED_USER:'需要补充信息',FAIL:'任务未完成'}[run.completion?.status]||
+      (run.status==='completed'?'已完成':'正在处理'));}
+  function showRunDiagnostics(id,report){
+    const target=$('run-diagnostics');
+    if(!report?.has_issues&&!report?.recovered_failures&&!report?.unverified_candidates?.length){target.hidden=true;target.innerHTML='';return;}
+    const issues=(report.issues||[]).map(item=>`<li>${escape(item.message)} · ${Number(item.count)||0} 次`+
+      (item.schools?.length?' · '+escape(item.schools.join('、')):'')+'</li>').join('');
+    const reasons=(report.completion_reasons||[]).map(reason=>`<li>${escape(reason)}</li>`).join('');
+    const candidates=(report.unverified_candidates||[]).map(item=>{
+      let link=escape(item.title||item.url||'候选页面');
+      try { const url=new URL(item.url); if(url.protocol==='https:'&&!url.username&&!url.password)
+        link=`<a href="${escape(url.href)}" target="_blank" rel="noopener noreferrer">${link}</a>`;
+      } catch (_) {}
+      return `<li>${link} · ${escape(item.university||'')} · 可能不匹配（未计入合格结果）`+
+        ` · ${escape(item.reason||'项目身份未确认')}</li>`;
+    }).join('');
+    target.innerHTML=`<details open><summary>${escape(report.summary||(report.recovered_failures?'查询已完成，工具异常已处理':'执行诊断'))}</summary><ul>${issues}${reasons}</ul>`+
+      (report.recovered_failures?`<p>过程中发生 ${Number(report.recovered_failures)||0} 次工具异常，最终查询条件已满足。</p>`:'')+
+      (report.tool_usage?.tool_limit?`<p>工具调用：${Number(report.tool_usage.tools_used)||0}/${Number(report.tool_usage.tool_limit)||0}；修复决策：${Number(report.tool_usage.decisions_used)||0}/${Number(report.tool_usage.decision_limit)||0}</p>`:'')+
+      (report.extraction_timeout_seconds?`<p>模型提取超时累计：${Number(report.extraction_timeout_seconds).toFixed(1)} 秒</p>`:'')+
+      (report.missing_fields?.length?`<p>仍缺少：${escape(report.missing_fields.map(x=>({deadline:'申请截止日期',gre_policy:'GRE 政策'}[x]||x)).join('、'))}</p>`:'')+
+      (candidates?`<h4>未确认匹配的搜索结果</h4><ul>${candidates}</ul><p>这些页面仅供核对，不作为答案证据或合格项目。</p>`:'')+
+      `<small>Run：${escape(id||'')}</small></details>`;
+    target.hidden=false;
   }
   function showRunInfo(id,traceId) {
     $('run-info').innerHTML=`Run：<a href="/api/v1/runs/${encodeURIComponent(id)}" target="_blank" rel="noopener">${escape(id)}</a>`+
@@ -128,6 +175,7 @@
     const rendered=role==='assistant'?markdown(content):`<div class="plain-text">${escape(content)}</div>`;
     article.innerHTML=`<div class="meta">${role==='user'?'你':'助手'}</div>${rendered}`;
     ui.messages.append(article); ui.messages.scrollTop=ui.messages.scrollHeight;
+    return article;
   }
   async function createConversation() {
     const item=await request('/conversations',{method:'POST',body:JSON.stringify({title:'新对话'})});
@@ -138,29 +186,78 @@
     if (!state.conversationId) await createConversation();
     state.running=true; $('chat-form').querySelector('button').disabled=true; $('run-status').textContent='正在处理';
     appendMessage('user',message); ui.steps.textContent='开始分析…';
+    showRunDiagnostics(null,null);
+    const conversationId=state.conversationId;
     try {
-      const run=await request('/conversations/'+encodeURIComponent(state.conversationId)+'/runs',{
+      const run=await request('/conversations/'+encodeURIComponent(conversationId)+'/runs',{
         method:'POST',body:JSON.stringify({message,request_id:crypto.randomUUID()})});
+      if(state.conversationId!==conversationId){finishRun();return;}
       showRunInfo(run.run_id);
-      await followRun(run.run_id,message,state.conversationId);
+      await followRun(run.run_id,message,conversationId);
     } catch(error) { toast(error.message); finishRun(); }
   }
   function finishRun(status='准备就绪') { state.running=false; $('chat-form').querySelector('button').disabled=false; $('run-status').textContent=status; }
-  function followRun(id,message,conversationId) {
+  function followRun(id,message,conversationId,initial=null) {
     return new Promise(resolve=>{
-      const stream=new EventSource('/api/v1/runs/'+encodeURIComponent(id)+'/events');
+      const cursor=Number(initial?.last_event_sequence||0);
+      const stream=new EventSource('/api/v1/runs/'+encodeURIComponent(id)+'/events?after='+cursor);
       let done=false;
+      let lastSequence=cursor, draft=null, stage='正在处理', lastPoll=0;
+      const started=initial?.created_at?Date.parse(initial.created_at):Date.now();
       let terminalStatus='准备就绪';
       let polling=false;
+      const owner={cancel(){if(done)return;done=true;stream.close();clearInterval(watchdog);
+        if(state.activeFollow===owner){state.activeFollow=null;finishRun();}resolve();}};
+      state.activeFollow=owner;
+      const renderProgress=()=>{
+        if(state.conversationId!==conversationId)return;
+        const elapsed=Math.max(0,Math.floor((Date.now()-started)/1000));
+        ui.steps.textContent=`${stage} · 已用时 ${Math.floor(elapsed/60)}分${elapsed%60}秒`;
+      };
+      const researchStage=data=>{
+        const names={parse:'解析查询条件',sql:'查询本地项目库',search:'搜索官网',read:'读取官网页面',
+          read_fallback:'尝试备用读取',extract:'提取并核验 GRE / 截止日期',school_done:'该项目处理结束',
+          extraction_unavailable:'模型提取多次失败，停止重复等待并整理已有结果',
+          repair_analyze:'分析工具失败原因',repair_adjust:'调整工具调用策略',repair_validate:'校验官网链接',
+          repair_budget_exhausted:'修复预算耗尽，整理已有结果'};
+        return (names[data.stage]||'检索中')+(data.school?' · '+data.school:'')+
+          (data.program?' · '+data.program:'')+(data.total?` · 项目 ${data.current||0}/${data.total}`:'')+
+          (data.tool?' · '+data.tool:'')+(data.tool_limit?` · 工具 ${data.tools_used||0}/${data.tool_limit}`:'')+
+          (data.error_code?' · '+data.error_code:'');
+      };
+      const restoredStage=data=>data.stage?researchStage(data):
+        ({run_preparing:'读取会话与相关记忆',goal_parse_started:'解析目标与成功标准',routing_started:'选择 Agent',
+          agent_started:'Agent 执行中',completion_checked:'检查结果',repair_round_started:'补查',
+          synthesis_started:'正在组织语言'}[data.event_type]||'正在处理');
+      const renderDraft=text=>{
+        if(state.conversationId!==conversationId)return;
+        if(!text){if(draft){draft.remove();draft=null;}return;}
+        if(!draft)draft=appendMessage('assistant','');
+        draft.innerHTML=`<div class="meta">助手 · 正在生成（尚未完成引用校验）</div><div class="plain-text">${escape(text)}</div>`;
+        ui.messages.scrollTop=ui.messages.scrollHeight;
+      };
+      if(initial?.draft_answer)renderDraft(initial.draft_answer);
+      showRunDiagnostics(id,initial?.failure_report);
+      if(initial?.progress)stage=restoredStage(initial.progress);
+      renderProgress();
       const watchdog=setInterval(async()=>{
         if(done||polling)return;
+        renderProgress();
+        if(Date.now()-lastPoll<5000)return;
+        lastPoll=Date.now();
         polling=true;
         try {const run=await request('/runs/'+encodeURIComponent(id));
           if(state.conversationId===conversationId)showRunInfo(id,run.trace_id);
+          if(state.conversationId===conversationId&&run.failure_report?.has_issues)showRunDiagnostics(id,run.failure_report);
           if(run.status==='completed'||run.status==='failed')await complete();
+          else if(stream.readyState!==1){
+            if(run.progress)stage=restoredStage(run.progress)+' · 连接恢复中';
+            if(run.draft_answer)renderDraft(run.draft_answer);
+            renderProgress();
+          }
         } catch(error) { /* SSE or the next poll can recover a transient failure. */ }
         finally{polling=false;}
-      },5000);
+      },1000);
       const complete=async()=>{
         if(done)return; done=true; stream.close();clearInterval(watchdog);
         try {
@@ -171,27 +268,45 @@
             await new Promise(resolve=>setTimeout(resolve,1000));
           }
           if(run.status!=='completed'&&run.status!=='failed')throw Error('处理时间过长，请稍后刷新对话查看结果');
-          terminalStatus=run.status==='failed'?'执行失败':'已完成';
+          terminalStatus=runLabel(run);
           if(state.conversationId===conversationId){
             showRunInfo(id,run.trace_id);ui.steps.textContent=terminalStatus;
-            if(run.status==='failed')showRunFailure(id,run.error,message);
-            else if(run.answer)appendMessage('assistant',run.answer);
+            showRunDiagnostics(id,run.failure_report);
+            if(run.status==='failed'){renderDraft('');showRunFailure(id,run.error,message);}
+            else if(run.answer){
+              if(draft)draft.innerHTML=`<div class="meta">助手</div>${markdown(run.answer)}`;
+              else appendMessage('assistant',run.answer);
+            }
           }
           await Promise.allSettled([loadProfile(),loadPlan(),loadApprovals(),loadMemory(),loadConflicts(true)]);
         } catch(error) { terminalStatus='状态获取失败';toast(error.message);ui.steps.textContent=terminalStatus; }
-        finishRun(terminalStatus); resolve();
+        if(state.activeFollow===owner){state.activeFollow=null;finishRun(terminalStatus);}resolve();
       };
-      const labels={run_started:'开始',goal_parsed:'解析目标',route_selected:'选择 Agent',agent_started:'Agent 执行中',
+      const labels={run_preparing:'读取会话与相关记忆',run_started:'开始',goal_parse_started:'解析目标与成功标准',
+        goal_parsed:'目标解析完成',routing_started:'选择 Agent',route_selected:'路由完成',agent_started:'Agent 执行中',
         agent_completed:'Agent 完成',completion_checked:'检查结果',repair_round_started:'补查',
-        approval_required:'等待确认',profile_conflict:'画像信息待核对',memory_updated:'偏好已保存',final_answer:'整理回答'};
-      for(const name of [...Object.keys(labels),'trace_started','run_completed','run_failed']) stream.addEventListener(name,event=>{
-        const data=JSON.parse(event.data||'{}').payload||{};
+        approval_required:'等待确认',profile_conflict:'画像信息待核对',memory_updated:'偏好已保存',
+        synthesis_started:'正在组织语言',synthesizer_fallback:'正在生成已有结果摘要',final_answer:'回答已生成'};
+      for(const name of [...Object.keys(labels),'run_diagnostics','research_progress','answer_snapshot','answer_reset','trace_started','run_completed','run_failed']) stream.addEventListener(name,event=>{
+        if(done)return;
+        let envelope;try{envelope=JSON.parse(event.data||'{}');}catch{return;}
+        const sequence=Number(envelope.sequence||event.lastEventId||0);
+        if(sequence&&sequence<=lastSequence)return;
+        if(sequence)lastSequence=sequence;
+        const data=envelope.payload||{};
         if(name==='trace_started'){if(state.conversationId===conversationId)showRunInfo(id,data.trace_id);return;}
         if(name==='run_completed'||name==='run_failed') { complete(); return; }
         if(state.conversationId!==conversationId)return;
-        ui.steps.innerHTML=`<span>${escape(labels[name]||name)}${data.agent?' · '+escape(data.agent):''}</span>`;
+        if(name==='run_diagnostics'){showRunDiagnostics(id,data);return;}
+        if(name==='answer_snapshot'){renderDraft(data.text||'');return;}
+        if(name==='answer_reset'){renderDraft('');return;}
+        stage=name==='research_progress'?researchStage(data):
+          (labels[name]||name)+(data.agent?' · '+data.agent:'')+
+          (name==='repair_round_started'?` · 第 ${Number(data.round_id||0)+1} 轮`:'')+
+          (name==='completion_checked'&&data.status?' · '+data.status:'');
+        renderProgress();
       });
-      stream.onerror=async()=>{ stream.close(); await complete(); };
+      stream.onerror=()=>{if(done)return;stage='进度连接暂时中断，正在自动重连';renderProgress();};
     });
   }
   async function loadProfile() { state.profile=await request('/profile'); renderProfile(); }

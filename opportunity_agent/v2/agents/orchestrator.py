@@ -25,6 +25,7 @@ from ...llm_context import conversation_scope
 from ...turn_understanding import assertion_text
 from ..core.config import settings
 from ..core.telemetry import span
+from ..core.research_budget import execution_seconds, synthesis_reserve
 from .a2a import OpenJiuwenDomainAgents, execute_domain_request, request_from_state
 from .result_aggregation import ResultAggregator
 from .profile_extraction import ProfileExtractionPipeline, is_contextual_profile_answer
@@ -42,8 +43,8 @@ from .contracts import (
     ResearchResult,
     RouteDecision,
     SuccessCriteria,
-    research_revision,
     merge_evidence,
+    research_revision,
 )
 
 
@@ -579,7 +580,9 @@ class DeterministicSynthesizer:
                     links = list(dict.fromkeys(f"[来源]({sources[eid].url})" for eid in fact.evidence_ids
                         if eid in sources and fact.field in sources[eid].supports_fields and usable(sources[eid], criteria)))
                     if links:
-                        rows.append(f"- {labels.get(fact.field, fact.field)}：{fact.value} {' '.join(links)}")
+                        notice = "（当前官网信息；适用入学季未确认）" if any(
+                            sources[eid].temporal_scope == "current_policy" for eid in fact.evidence_ids if eid in sources) else ""
+                        rows.append(f"- {labels.get(fact.field, fact.field)}：{fact.value}{notice} {' '.join(links)}")
                 if rows:
                     sections.append(f"**{program.university} — {program.program}（{program.intake}）**\n\n" + "\n".join(dict.fromkeys(rows)))
             sources = {e.evidence_id: e for e in [*research.evidence, *(e for p in research.programs for e in p.evidence)]}
@@ -594,27 +597,19 @@ class DeterministicSynthesizer:
                         f"[来源]({sources[eid].url})" for eid in finding.evidence_ids)))
             if research.missing_items:
                 sections.append("仍有未核实项目：" + "；".join(str(i.get("reason") or i.get("field") or i.get("kind", "缺少证据")) for i in research.missing_items))
+            if state.completion and state.completion.status == "PARTIAL":
+                from ..research.failures import failure_summary
+                sections.extend(failure_summary(research))
             if sections:
-                return prefix + "\n\n".join(sections)
-            # Keep a failed official lookup actionable. A generic database
-            # abstention hides whether discovery, reading, or identity matching
-            # failed and gives the user no useful next step.
+                return prefix + "\n\n".join(dict.fromkeys(sections))
             diagnostics = research.diagnostics
             if diagnostics.get("web_attempted") or diagnostics.get("web_provider"):
                 attempted = diagnostics.get("web_targets_attempted", [])
-                target_text = "、".join(dict.fromkeys(
-                    str(item.get("university", "")) for item in attempted if item.get("university"))) or "登记的官方域名"
-                errors = research.errors[:3]
-                detail = []
-                if diagnostics.get("official_pages_read"):
-                    detail.append(f"已读取 {diagnostics['official_pages_read']} 个官方页面，但页面内容没有形成当前问题需要的字段")
-                elif diagnostics.get("web_discovery"):
-                    detail.append("已查询官网 sitemap/搜索候选，但尚未找到与项目和入学季同时匹配的页面")
-                if errors:
-                    detail.append("；".join(str(item.get("code") or item.get("detail") or item.get("stage")) for item in errors))
-                detail_text = "；".join(detail) or "官网读取阶段未返回可引用正文"
-                return prefix + f"我已尝试检索{target_text}的官方页面。{detail_text}。请优先打开已登记官网的项目招生页，或补充学校/项目名称，我会继续按官网原文查找。"
-            return prefix + "当前结果中还没有可直接引用的官网原文；请提供学校和项目名称，我会按已登记官方域名检索对应招生页面。"
+                targets = "、".join(dict.fromkeys(str(item.get("university", ""))
+                    for item in attempted if item.get("university"))) or "登记的官方域名"
+                return prefix + f"我已尝试检索{targets}的官方页面，但这次没有形成可直接引用的正文。" \
+                    "请补充学校或项目的完整名称，我会继续从对应官网页面查找。"
+            return prefix + "当前结果中还没有可直接引用的官网原文；请提供学校和项目名称，我会按已登记官方域名检索。"
         if state.plan_result and state.plan_result.timeline:
             return "我已整理申请时间线和下一步建议。"
         return prefix + "我已理解你的问题。"
@@ -632,13 +627,16 @@ def _research_for_synthesis(result: ResearchResult | None) -> dict[str, Any] | N
     if result is None:
         return None
     payload = result.model_dump(mode="json", exclude={"diagnostics", "route_history"})
+    from ..research.failures import failure_summary
+    payload["failure_summary"] = failure_summary(result)
     payload["research_diagnostics"] = {
         key: result.diagnostics[key] for key in (
             "web_provider", "web_fallback_reason", "web_targets_attempted", "web_discovery",
             "pages_checked", "official_pages_read", "search_calls", "page_calls", "web_rejections",
             "errors", "persist_errors") if key in result.diagnostics
     }
-    evidence = {e.evidence_id: e for e in merge_evidence([*result.evidence, *(e for p in result.programs for e in p.evidence)])}
+    evidence = {e.evidence_id: e for e in merge_evidence(
+        [*result.evidence, *(e for p in result.programs for e in p.evidence)])}
     payload["evidence"] = [e.model_dump(mode="json") for e in evidence.values()]
     for program, source in zip(payload.get("programs", []), result.programs, strict=True):
         program["evidence_ids"] = [item.evidence_id for item in source.evidence]
@@ -673,15 +671,29 @@ GRE policy, citation, or user preference. If research evidence is absent or a fi
 is unknown, say that it is unverified. For research facts, preserve source URLs from
 the supplied evidence as Markdown links when they are available; never fabricate a
 link. Do not cite a source that does not support the sentence immediately before it.
-When official-page findings are present, quote at least one exact excerpt in the answer. Never answer with only a generic “not found”, “database has no record”, or “I could not verify” statement: use the supplied research diagnostics to state which official-domain stage was attempted and what concrete follow-up is possible.
+When official-page findings are present, quote at least one exact excerpt in the answer.
+Never answer with only a generic “not found”, “database has no record”, or “I could
+not verify” statement: use research diagnostics to state which official-domain
+stage was attempted and what concrete follow-up is possible.
 For ResearchResult, use only verified facts with their own evidence_ids. Unknown,
 stale, conflicting, or relevance_passed=false evidence is not a verified fact.
 Each programme lists evidence_ids only; resolve them against research_result.evidence,
 which holds every evidence object exactly once.
+Evidence with temporal_scope=current_policy is a freshly read official policy, not
+confirmation of the requested admission cycle. It may be used, but explicitly label
+its intake as unconfirmed and retain exact source dates. Retrieval date alone never
+  proves that a deadline or GRE policy applies to 2027 Fall. Do not infer missing years.
+  Exception for source-bound partial dates: an unknown deadline with evidence whose
+  extraction_provenance.year_status=unknown may be quoted as "the page lists [source
+  date], but the year/requested cycle is unconfirmed", with its citation. Never
+  convert it to an ISO date, infer this year, or present it as satisfying completion.
 Semantic relevance does not establish GRE or deadlines. Findings can answer a
 semantic question without a programme list. Reranker scores are not university rankings.
 If completion is PARTIAL, clearly state what was verified, what remains missing,
-and why no unsupported conclusion was added. If completion is NEED_USER, ask only
+and why no unsupported conclusion was added. Use research_result.failure_summary
+to distinguish search, webpage reading, LLM extraction, and budget failures.
+Never describe LLM extraction failure as an inaccessible official website.
+If completion is NEED_USER, ask only
 for the listed missing information. If completion is FAIL, explain only the listed
 failure at a high level; do not fabricate a partial research answer.
 
@@ -728,20 +740,49 @@ described as replacing the user's current roadmap."""
         background = dict(state.conversation_context)
         if state.recent_messages:
             background["recent_messages"] = state.recent_messages[-6:]
+        loop = asyncio.get_running_loop()
+        draft, last_emit, emitted = "", 0., 0
+        accepting = True
+        def receive(chunk):
+            nonlocal draft, last_emit, emitted
+            if not accepting or cancel.is_set():
+                return
+            draft += chunk
+            now = time.monotonic()
+            if now-last_emit >= .2 and emitted < 149:
+                publish()
+                last_emit = now
+        def publish():
+            nonlocal emitted
+            # Drafts are plain text. Hide URL fragments until final citation validation.
+            public = re.sub(r"https?://[^\s<>)\]]*", "引用待核验", draft)
+            public = re.sub(r"(?:h|ht|htt|http|https|https?:|https?:/)$", "", public)
+            state.add_event("answer_snapshot", text=public, provisional=True)
+            emitted += 1
+        def on_delta(chunk):
+            if not cancel.is_set():
+                loop.call_soon_threadsafe(receive, chunk)
         try:
             with conversation_scope(background):
+                method = getattr(self.client, "generate_stream", self.client.generate)
+                stream_options = {"on_delta": on_delta} if hasattr(self.client, "generate_stream") else {}
                 answer = await asyncio.to_thread(
-                    self.client.generate,
-                    system=self._SYSTEM_PROMPT,
-                    user=json.dumps(context, ensure_ascii=False, default=str),
-                    temperature=0.2,
-                    max_tokens=config["MAX_TOKENS"],
-                    thinking=False,
-                    deadline=deadline, cancel_event=cancel, diagnostics=diagnostics,
+                method,
+                system=self._SYSTEM_PROMPT,
+                user=json.dumps(context, ensure_ascii=False, default=str),
+                temperature=0.2,
+                max_tokens=config["MAX_TOKENS"],
+                thinking=False,
+                deadline=deadline, cancel_event=cancel, diagnostics=diagnostics,
+                **stream_options,
                 )
+                await asyncio.sleep(0)
+                if draft and emitted < 150:
+                    publish()
         except Exception as exc:
             raise SynthesizerUnavailable(f"LLM Synthesizer failed: {type(exc).__name__}: {exc}") from exc
         finally:
+            accepting = False
             cancel.set()
             state.add_event("synthesizer_diagnostics", attempts=[dict(d) for d in diagnostics])
         if not answer.strip():
@@ -770,15 +811,12 @@ described as replacing the user's current roadmap."""
             state.add_event("citation_validation", rejected_count=len(invalid))
         return answer.strip()
 
-
-
-
 class CustomOrchestrator:
     """Application control plane; domain agents never call each other here."""
 
     def __init__(self, *, goal_parser: GoalParser | None = None, router: Router | None = None,
                  agent_client: DomainAgentClient | None = None, synthesizer: Synthesizer | None = None,
-                 max_rounds: int = 3, execution_budget_seconds: float = 180) -> None:
+                 max_rounds: int = 3, execution_budget_seconds: float | None = None) -> None:
         # Use structured LLM extraction when configured, with the deterministic
         # parser as an offline-safe fallback for local development and tests.
         self.goal_parser = goal_parser or LLMGoalParser()
@@ -787,7 +825,8 @@ class CustomOrchestrator:
         self.synthesizer = synthesizer or LLMSynthesizer()
         self.aggregator = ResultAggregator()
         self.max_rounds = max_rounds
-        self.execution_budget_seconds = execution_budget_seconds
+        self.dynamic_budget = execution_budget_seconds is None
+        self.execution_budget_seconds = execution_budget_seconds if execution_budget_seconds is not None else 180.
 
     @staticmethod
     def _default_agent_client() -> DomainAgentClient:
@@ -808,8 +847,10 @@ class CustomOrchestrator:
             await close()
 
     async def run(self, state: ExecutionState) -> ExecutionState:
-        state._execution_deadline = time.monotonic() + self.execution_budget_seconds
+        state._execution_started = time.monotonic()
+        state._execution_deadline = state._execution_started + self.execution_budget_seconds
         scope = asyncio.timeout(self.execution_budget_seconds)
+        state._execution_scope = scope
         try:
             async with scope:
                 result = await self._run(state)
@@ -830,6 +871,10 @@ class CustomOrchestrator:
 
     async def _synthesize_with_fallback(self, state: ExecutionState) -> str:
         """Agent work already spent must not be lost to a wording-only failure."""
+        state.add_event("synthesis_started")
+        if state.completion and state.completion.status in {"PARTIAL", "FAIL", "NEED_USER"}:
+            from ..research.failures import run_failure_report
+            state.add_event("run_diagnostics", **run_failure_report(state))
         try:
             budget = float(synthesizer_config()["BUDGET_SECONDS"])
             if state._execution_deadline:
@@ -842,6 +887,7 @@ class CustomOrchestrator:
                 raise SynthesizerUnavailable("empty answer")
             return answer
         except (SynthesizerUnavailable, TimeoutError) as exc:
+            state.add_event("answer_reset")
             state.add_event("synthesizer_fallback", error_code=type(exc).__name__)
             return await DeterministicSynthesizer().synthesize(state)
 
@@ -854,6 +900,7 @@ class CustomOrchestrator:
 
     async def _run(self, state: ExecutionState) -> ExecutionState:
         state.add_event("run_started", run_id=state.run_id)
+        state.add_event("goal_parse_started")
         state.turn_preferences = explicit_preferences(state.message)
         with span("orchestrator.guard") as guard_span:
             forced_agents = self._guard(state.message, state.conversation_context)
@@ -887,6 +934,7 @@ class CustomOrchestrator:
                     "version": avoid.get("version"), "source": avoid.get("source"), "key": "avoid_gre"})
                 state.success_criteria = criteria
         state.add_event("goal_parsed", has_criteria=state.success_criteria is not None)
+        state.add_event("routing_started")
         with span("orchestrator.router"):
             try:
                 state.route_decision = await self.router.route(state, forced_agents)
@@ -926,6 +974,14 @@ class CustomOrchestrator:
             )
         state.add_event("route_selected", **state.route_decision.model_dump(mode="json"))
 
+        if self.dynamic_budget and "research" in state.route_decision.agents:
+            query = state.route_decision.resolved_query or state.message
+            budget = execution_seconds(query, self.max_rounds,
+                state.success_criteria.required_program_count if state.success_criteria else None)
+            state._execution_deadline = state._execution_started + budget
+            state._execution_scope.reschedule(state._execution_deadline)
+            state.add_event("execution_budget_selected", seconds=budget, mode="per_school")
+
         if state.route_decision.mode == "direct_reply":
             state.answer = await self._synthesize_with_fallback(state)
             state.add_event("final_answer", mode="direct_reply", approval_required=False)
@@ -948,7 +1004,16 @@ class CustomOrchestrator:
             checker_span.set_attribute("completion.status", state.completion.status)
         state.add_event("completion_checked", **state.completion.model_dump(mode="json"))
 
-        while state.completion.status == "RETRY" and state.round_id + 1 < self.max_rounds and time.monotonic() < state._execution_deadline:
+        repair_deadline = state._execution_deadline - (synthesis_reserve() if self.dynamic_budget else 0)
+        while state.completion.status == "RETRY" and state.round_id + 1 < self.max_rounds and time.monotonic() < repair_deadline:
+            ledger = state.research_result.diagnostics.get("tool_execution", {}) if state.research_result else {}
+            research_blocked = (state.research_result and state.research_result.diagnostics.get("tool_targets_exhausted")) or ledger.get("blocked") or (ledger.get("tool_limit") is not None
+                and ledger.get("tools_used", 0) >= ledger["tool_limit"])
+            if research_blocked and state.completion.missing_tasks and all(t.agent == "research" for t in state.completion.missing_tasks):
+                state.completion = CompletionResult(status="PARTIAL", missing_tasks=state.completion.missing_tasks,
+                    reasons=[*state.completion.reasons, "研究工具预算耗尽、服务已停止或已无可执行的新补查动作，保留已有结果。"])
+                state.add_event("completion_checked", **state.completion.model_dump(mode="json"))
+                break
             state.round_id += 1
             missing = state.completion.missing_tasks
             state.add_event("repair_round_started", round_id=state.round_id, task_count=len(missing))
@@ -961,7 +1026,7 @@ class CustomOrchestrator:
         if state.completion.status == "RETRY":
             state.completion = CompletionResult(
                 status="PARTIAL", missing_tasks=state.completion.missing_tasks,
-                reasons=[*state.completion.reasons, "已达到本次执行时间预算。" if time.monotonic() >= state._execution_deadline else "已达到本次补查轮数上限。"],
+                reasons=[*state.completion.reasons, "已达到本次执行时间预算。" if time.monotonic() >= repair_deadline else "已达到本次补查轮数上限。"],
             )
             state.add_event("completion_checked", **state.completion.model_dump(mode="json"))
 
@@ -1034,6 +1099,8 @@ class CustomOrchestrator:
             state.add_event("agent_started", agent=name, round_id=state.round_id)
         async def budgeted(name):
             remaining = state._execution_deadline - time.monotonic() if state._execution_deadline else self.execution_budget_seconds
+            if name == "research" and self.dynamic_budget:
+                remaining -= synthesis_reserve()
             timeout_scope = asyncio.timeout(max(.01, remaining))
             try:
                 async with timeout_scope:
@@ -1041,7 +1108,8 @@ class CustomOrchestrator:
             except TimeoutError:
                 if name != "research" or not timeout_scope.expired():
                     raise
-                state._execution_deadline = min(state._execution_deadline or time.monotonic(), time.monotonic())
+                if not self.dynamic_budget:
+                    state._execution_deadline = min(state._execution_deadline or time.monotonic(), time.monotonic())
                 return ResearchResult(status="no_results", route="stub",
                     errors=[{"stage": "research", "code": "budget_exhausted"}],
                     missing_items=[{"kind": "budget_exhausted"}])
@@ -1120,6 +1188,7 @@ class CustomOrchestrator:
                     agent="research",
                     reason="尚未得到带可靠且高相关来源的研究结果",
                     excluded_programs=[item.identity for item in valid],
+                    missing_fields=list((research.diagnostics.get("task", {}) if research else {}).get("requested_fields", [])),
                 ))
                 reasons.append("尚未得到可追溯且与问题高度相关的研究证据。")
 

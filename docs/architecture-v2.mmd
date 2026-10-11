@@ -16,11 +16,16 @@ flowchart TB
         RAG[RAG · 向量 + 全文 / RRF / Reranker]
         HYB[Hybrid · SQL 条件 + 语义证据]
         WEB[MCP / Web · 官网搜索与读取]
+        RP[Repair Planner · 结构化错误 → 单个修复动作]
+        TL[(Redis · Run 级工具预算 / 检查点 / 熔断)]
         EV[项目 / 周期 / 引句 / 字段证据校验]
         Q --> SQL & RAG & HYB & WEB
         SQL & RAG & HYB --> EV
         EV -->|缺失 / 过期 / 要求最新| WEB
         WEB --> EV
+        WEB -->|失败 / 无结果 / 证据不足| RP
+        RP -->|受控工具执行 · 安全 / 范围 / 预算校验| WEB
+        WEB <--> TL
     end
     RES --> Q
     EV --> RR[ResearchResult]
@@ -31,7 +36,7 @@ flowchart TB
     C -->|RETRY · 缺失任务| O
     O -->|定向补查研究缺项| RES
     C -->|PASS / PARTIAL / NEED_USER / FAIL| S
-    S --> F[最终 answer → 前端]
+    S -->|answer_snapshot 草稿 / 最终 answer| F[前端]
     S -.->|超时 / 不可用| FB[确定性降级 · 核验事实 / 缺口说明]
     FB --> F
 

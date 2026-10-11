@@ -17,6 +17,21 @@ Router 只选择执行路径，领域 Agent 返回结构化结果，Synthesizer 
 - **定向修复**：保留合格结果，仅补查缺项，去重合并后重新检查。
 - **可观测与容错**：REST / SSE、持久化事件、Run / Trace 标识、可选 Jaeger，以及合成失败后的确定性回复。
 
+## 最近更新：2026-10-11
+
+- **按学校估算时间预算**：Research 按学校数量分配时间，受单校、Research 总时间及整个执行时间上限约束，并预留最终合成时间；广泛查询默认估算 10 所学校。
+- **有界工具修复**：搜索无结果、读取失败或字段证据不足时，独立 `ResearchRepairPlanner` 接收结构化错误，选择改写搜索、备用 MCP 读取或 compact 提取；代码校验参数、学校／项目／年份范围、官网地址与预算。开关 `RESEARCH_TOOL_REPAIR_ENABLED` 默认关闭。
+- **跨轮次保留状态**：Redis Run 级账本累计调用、失败签名、熔断和目标进度；Orchestrator 补查不清零预算，不重复启动已耗尽目标。已有合格结果保留，新证据合并去重后重新检查。
+- **阶段进度与诊断**：前端通过 SSE 显示当前阶段、学校、工具和修复原因，最终诊断区分网页读取、模型提取、来源校验和预算失败；不是模型思维过程。支持事件游标重连和 Run 状态补查。
+- **缩写与未确认候选**：CSE 不再全局展开成固定项目全称，结合官方页面标题／标题行判断本地含义；未能确认匹配的候选在诊断区显示“可能不匹配”，附来源链接，不计入合格结果。旧 Run 可从保留的工具记录恢复部分候选；未执行提取的页面不推定为匹配或不匹配。
+- **流式回答草稿**：模型传输接入 SSE，前端按持久化 `answer_snapshot` 显示增量草稿；草稿不是已核验最终答案，合成失败会清除草稿并降级，完成后以最终答案替换。不是每个 token 单独发布一个事件。
+- **官网入学季适用性**：不再要求每个页面出现 `2027 Fall`；未标明入学季的当前官网信息标记 `temporal_scope=current_policy`，来源入学季留空，可参与筛选，但回答须注明“适用入学季未确认”。明确不匹配的入学季仍拒绝；缓存及语义检索保留该区别。
+- **提取与日期格式**：提取模型、修复模型可分别配置；支持完整英语、月份缩写、ISO、数字及中文日期格式，新增 MSCSE 名称识别。当前也包含缺少年份时的实验性推断，风险和边界见下文，不能把推断视为官网已确认年度。
+
+本次发布前选择性离线 V2 回归：**375 passed / 5 skipped / 300 deselected**。未配置的 Redis／PostgreSQL 集成项及未选择的评测项不算通过；外部官网、真实模型质量和浏览器体验不由离线桩测试证明。此前单页面只读验证能从 CMU MSAII 官网提取完整日期与 GRE required，不代表所有学校、所有查询已验收。
+
+本次没有迁移 V1 对话，也没有添加在线评估 Agent。当前仍保留 SQL／RAG／Hybrid／MCP 四路径，**尚未改成“联网优先、文档 RAG 可选”的新实现**。
+
 ## V1 与 V2
 
 | | V1 | V2（本文重点） |
@@ -38,7 +53,7 @@ V1 继续保留，部分画像、规划逻辑由 V2 复用；**V1 的 `data/conv
 
 ![V2.2 多智能体架构设计参考图](docs/assets/v2-2-reference-architecture.png)
 
-上图是设计参考，包含尚未实现或已调整的内容：情景记忆、逐 token 输出、Router 的框架形态和部分存储描述不能作为现有能力证明。实际控制流、权限及更新时机以下面的代码架构图和“当前缺陷”章节为准。
+上图是设计参考，包含尚未实现或已调整的内容：情景记忆、Router 的框架形态和部分存储描述不能作为现有能力证明。实际控制流、增量回答、权限及更新时机以下面的代码架构图和“当前缺陷”章节为准。
 
 ### 当前代码架构图
 
@@ -61,11 +76,16 @@ flowchart TB
         RAG[RAG · 向量 + 全文 / RRF / Reranker]
         HYB[Hybrid · SQL 条件 + 语义证据]
         WEB[MCP / Web · 官网搜索与读取]
+        RP[Repair Planner · 结构化错误 → 单个修复动作]
+        TL[(Redis · Run 级工具预算 / 检查点 / 熔断)]
         EV[项目 / 周期 / 引句 / 字段证据校验]
         Q --> SQL & RAG & HYB & WEB
         SQL & RAG & HYB --> EV
         EV -->|缺失 / 过期 / 要求最新| WEB
         WEB --> EV
+        WEB -->|失败 / 无结果 / 证据不足| RP
+        RP -->|受控工具执行 · 安全 / 范围 / 预算校验| WEB
+        WEB <--> TL
     end
     RES --> Q
     EV --> RR[ResearchResult]
@@ -76,7 +96,7 @@ flowchart TB
     C -->|RETRY · 缺失任务| O
     O -->|定向补查研究缺项| RES
     C -->|PASS / PARTIAL / NEED_USER / FAIL| S
-    S --> F[最终 answer → 前端]
+    S -->|answer_snapshot 草稿 / 最终 answer| F[前端]
     S -.->|超时 / 不可用| FB[确定性降级 · 核验事实 / 缺口说明]
     FB --> F
 
@@ -118,6 +138,21 @@ flowchart TB
 - **MCP / Web**：Tavily 搜索和受控官网读取；缺失、过期或要求最新时可触发，不保证每次都找到有效证据。
 
 在线核验通过的结构化事实默认同步写入缓存；有效期内普通查询可直接走 SQL。全文／向量摄取是独立可选流程，旧待审核记录不会自动提升为可信数据。
+
+### 工具级修复与任务级补查
+
+这两种循环不共用职责：Research 内部修复一个失败工具；Orchestrator 根据 Checker 的缺项定向补查。Router 不做工具决策，Checker 不持有结果，修复成功也不自动意味着查询达标。
+
+| 默认限制 | 值 |
+|---|---|
+| 每校工具／修复决策 | 6 次／2 次 |
+| 每校时间 | 关闭修复为 60 秒，启用后为 90 秒；可由 `RESEARCH_PER_SCHOOL_SECONDS` 覆盖 |
+| 全 Run 工具／决策 | `min(60, 6 × N)`／`min(20, 2 × N)` |
+| 单次修复决策 | 20 秒，无隐式重试 |
+| 同页提取 | 最多 2 次，第二次须改变档位或缩减字段 |
+| Research／执行总时间 | 默认最多 600／1800 秒，仍受父级剩余时间约束 |
+
+`N` 首次进入 Research 时确定，补查不扩容。首轮、失败、备用读取和模型提取均计数；增大单校时间不会增加工具次数。启用修复但账本不可用时停止外部调用，不无计数执行。模型连续服务故障触发熔断；项目、来源不匹配不算模型服务故障。
 
 ## 快速开始：Docker
 
@@ -179,13 +214,43 @@ docker compose -f docker-compose.yml -f docker-compose.research.yml up -d --buil
 
 后续 `ps / logs / exec` 沿用所选的 `-f` 参数。API 启动时执行 Alembic 迁移，升级已有数据库前先备份。RAG 校准文件需来自人工 dev 标注，详见 [Research 运行与评测](docs/research_agent.md)。
 
+### 单独配置提取模型与工具修复
+
+在 `.env` 中设置，模型名称及参数必须由自己的网关支持。以下仅为配置示例，不承诺 Luna 在每个网关都可用或必然更快：
+
+```dotenv
+LLM_MODEL=gpt-5.5
+RESEARCH_EXTRACT_MODEL=gpt-6-luna
+RESEARCH_EXTRACT_REASONING_EFFORT=none
+RESEARCH_TOOL_REPAIR_ENABLED=1
+# 可选；不设置时修复决策继承 LLM_MODEL，不继承提取模型
+# RESEARCH_REPAIR_MODEL=<网关支持的模型>
+```
+
+仅改变提取模型不需要换掉 Router／Planning／Synthesizer 的全局模型。GPT 请求需要显式 `reasoning_effort`；代码中的 `thinking=False` 仅对 Qwen 扩展生效。模型替换需用相同页面比较延迟、超时率和通过引用校验的事实数，不能只比较响应速度。
+
+修改这些 Research 环境变量后，按原运行方式重新创建服务。GPU overlay 示例：
+
+```powershell
+docker compose -f docker-compose.yml -f docker-compose.research.yml up -d --no-deps --force-recreate research
+```
+
+仅环境变量变化不需要 `--build`；`restart` 不会加载新环境变量。修改 Python／前端代码则先构建，并更新受影响服务：
+
+```powershell
+docker compose -f docker-compose.yml -f docker-compose.research.yml build research api
+docker compose -f docker-compose.yml -f docker-compose.research.yml up -d --no-build --no-deps research api
+```
+
+更新前确认没有查询正在执行；`--no-deps` 表示不重建依赖服务，不是关闭依赖功能。CPU 或基础模式使用对应的 Compose 参数。更新后发起新 Run，旧 Run 不会自动重跑；修改全局模型或 API 预算时还需重新创建相关服务。
+
 ### 3. 从前端体验
 
 1. 打开 [V2 前端](http://127.0.0.1:8000/v2)，注册并登录测试账号。
 2. 新建对话，发送下方样例；查看执行步骤、回复和 Run / Trace 标识。
 3. 核对并接受待确认的画像／规划变更；在“偏好”页查看和撤销已保存偏好。
 4. [FastAPI Docs](http://127.0.0.1:8000/docs) 提供接口说明，健康检查为 `/healthz`。
-5. GPU / OTel overlay 提供 [Jaeger](http://127.0.0.1:16686)，按 Trace ID 查看跨服务调用。
+5. 基础 Compose 已提供 [Jaeger](http://127.0.0.1:16686)，按 Trace ID 查看跨服务调用；API、三个 Agent 和 Worker 均配置 OTLP HTTP 导出。追踪数据默认保存在内存中，Jaeger 重启后不保留。
 
 Docker 模式**不需要宿主机再 pip 安装或执行 `run_v2_local.ps1`**。后者是 SQLite 本地开发入口，不是完整 Docker / pgvector 链路。
 
@@ -285,7 +350,7 @@ GET /api/v1/runs/{run_id}/events
 
 使用同一主机名登录和访问接口，不混用 `localhost` 与 `127.0.0.1` 的 Cookie。命令行需保留登录 Cookie 或携带 Bearer Token，否则返回 `authentication required`。
 
-重点事件：`route_selected`、`agent_started/completed/failed`、`completion_checked`、`repair_round_started`、`synthesizer_diagnostics/fallback`、`memory_updated`、`run_completed/failed`。Run `completed` 表示执行结束，业务完成度还要看 `completion.status`。
+重点事件：`route_selected`、`agent_started/completed/failed`、`research_progress`、`completion_checked`、`repair_round_started`、`answer_snapshot/reset`、`run_diagnostics`、`synthesizer_diagnostics/fallback`、`memory_updated`、`run_completed/failed`。Run `completed` 表示执行结束，业务完成度还要看 `completion.status`。
 
 离线开发测试在宿主机安装依赖，与 Docker 运行方式分开：
 
@@ -299,7 +364,21 @@ python -m pytest tests/test_v2_full_chain.py tests/test_v2_memory.py tests/test_
 
 全量 V2 回归：`python -m pytest tests -k v2 -q`。受控链路测试覆盖 HTTP / SSE、三个 Python A2A 服务、四种 Research 路径、汇总与合成；模型文本、外部网页及部分检索分数是测试替身，**不能据此声称真实 RAG Precision / Recall 很高**。
 
-测试方法与诊断入口见 [Research 文档](docs/research_agent.md) 和 [合成容错与缓存说明](docs/synthesis_cache_reliability.md)。本地历史报告不随本次文档提交发布，也不代表当前 checkout 的实时测试结果；真实双查询验收曾因模型网关认证失败而未完成。
+本次选择性离线回归命令（不要求外部模型和 Redis）：
+
+```powershell
+$env:DOMAIN_AGENT_TRANSPORT = "local"
+$env:OPPORTUNITY_AGENT_DISABLE_DOTENV = "1"
+Remove-Item Env:V2_TEST_REDIS_URL -ErrorAction SilentlyContinue
+python -m pytest tests -q -k "v2 and not benchmark and not dataset and not llm_review and not llm_export and not eval_database and not markdown"
+node tests/router_frontend_check.cjs
+```
+
+需要验证 Redis 原子预算／跨轮恢复时，显式设置 `V2_TEST_REDIS_URL` 为已启动、允许测试的 Redis 地址，再运行 `tests/test_v2_tool_repair.py`。不能把不可达服务引起的失败当成离线功能失败，也不能把跳过项算作验收通过。
+
+真实只读 Research 冒烟入口：`python scripts/verify_v2_tool_repair.py --seconds 180`，使用当前模型／数据库配置，会产生外部工具费用，但不创建账号或对话、不写知识事实；结束仅删除它创建的独立 Redis 测试键。该脚本不执行 Orchestrator 多轮补查，不等同于完整浏览器验收。
+
+测试方法与诊断入口见 [Research 文档](docs/research_agent.md) 和 [合成容错与缓存说明](docs/synthesis_cache_reliability.md)。本地历史报告不随本次提交发布，也不代表当前 checkout 的实时测试结果；此前未完成的真实双查询验收不能由单页面提取成功替代。
 
 ## 人工审核网站：复核 LLM 预标注
 
@@ -360,7 +439,7 @@ python -m opportunity_agent.v2.evaluation.research_dataset export --dir delivera
 
 ## 当前缺陷与安全检查
 
-以下为 **2026-10-09** 对当前代码的检查，不是完整渗透测试或质量认证。详细证据与检查范围见 [代码与安全审查记录](docs/code-review-20261009.md)。
+以下保留 **2026-10-09** 的历史审查基线，不是完整渗透测试或质量认证。部分诊断／修复／SSE 问题已在本次更新中改善；未完成事项仍需独立验收。详细证据与检查范围见 [代码与安全审查记录](docs/code-review-20261009.md)。
 
 本次针对性离线回归 **114 passed / 1 skipped**，覆盖审核站、预标注、鉴权、记忆、合成缓存和路由；离线运行需显式 `DOMAIN_AGENT_TRANSPORT=local`，跳过项需独立 PostgreSQL 测试连接。没有把该结果当成真实模型或 RAG 质量验收。
 
@@ -369,9 +448,10 @@ python -m opportunity_agent.v2.evaluation.research_dataset export --dir delivera
 | P1 · 公开部署前 | 默认开发数据库口令、API 监听所有网卡；登录没有限流，Run 无用户级队列配额 | 保持本机演示；上线前补 HTTPS、安全 Cookie、强密钥检查、限流与成本配额 |
 | P1 · 信任边界 | A2A 未配置服务间身份验证；stdio MCP 工具接受调用方 `user_id`；审核站没有独立鉴权 | A2A 留在可信内网，MCP 仅受信宿主使用；远程化前绑定调用身份，审核站增加访问保护 |
 | P1 · 上下文 | Router 启发式判断独立查询后清空历史；需要历史时仅取最后 6 条 | 多轮年份、项目及约束可能丢失；实现带来源的 Context Resolver，当前明确条件优先 |
-| P1 · 诊断 / 修复 | Run 异常路径没有保存完整中间结果；无新增证据时可重复相似补查 | 保存脱敏阶段快照，显示 MCP 拒绝原因；增加无进展检测和策略切换 |
+| P1 · 诊断 / 修复 | 已新增失败诊断、预算账本、检查点及无可行动作停止；异常中断后的完整恢复仍需验证 | 覆盖服务重启、租约恢复、并发账本争用和停止时的中间结果持久化 |
+| P1 · 日期 / 通用来源 | 新日期解析器包含按日历／页面上下文推断缺失年份；通用页面 GRE／deadline 在部分检查中放宽，但 Web 接收仍要求精确项目 | 不能用版权年份证明申请季；补推断标签、字段作用范围和端到端通用页面验证，避免将推断日期当作官网确认日期 |
 | P1 · 业务能力 | 年度总预算未成为完整成功标准与费用核验条件；偏好识别范围有限 | 通用候选、澄清与能力检查；无法预算筛选时明确告知，不作已筛选承诺 |
-| P2 · 资源 / 恢复 | 同步模型调用取消后仍可能等待线程；SSE 长连接持有 DB session；Run 使用固定租约 | 验证负载、取消、连接池压力及恢复；增加心跳、断线游标和并发预算 |
+| P2 · 资源 / 恢复 | 同步模型调用取消后仍可能等待线程；SSE 已按读取事件短时打开 session，Run 租约与负载恢复仍需验证 | 保留调用 deadline／超时、断线游标和并发预算，补取消及连接池压力测试 |
 | P2 · 测试配置 | 部分基础单测未显式注入领域执行器，默认会尝试 A2A | 离线回归设置 `DOMAIN_AGENT_TRANSPORT=local`；后续消除环境依赖，不把单测误当真实 A2A 验收 |
 | P2 · 记忆时机 | PASS 后即使合成降级也可能提交归纳任务 | 显式记录合成结果，严格区分模型成功与兜底，不改变已经返回的事实 |
 | P2 · 检索质量 | RAG 人工校准及独立 test 质量未完成，待审核字段不能作为可靠 SQL 结果 | 完成人工 gold，再验收检索与引用；不能用 Checker PASS 或合成数据高分代替 |
@@ -383,14 +463,14 @@ python -m opportunity_agent.v2.evaluation.research_dataset export --dir delivera
 |---|---|---|
 | 1 | Context Resolver 与结构化活动任务状态；替代简单整条 pin，保留当前实体和字段 | 年份继承、换话题、六校澄清列表、多轮纠正、历史注入与跨用户隔离回归 |
 | 2 | 通用偏好候选与澄清；预算能力边界和费用结构化事实 | 漏识别、不明确币种／范围、临时覆盖、假设不写入；数据齐备后才验收费率、年度总费用和未知值处理 |
-| 3 | 检索诊断与有效定向修复；失败快照、无进展停止 | “5 个首轮 4 个”、无效补查、错误周期、来源拒绝、MCP 超时；确认旧结果保留且不无限重跑 |
+| 3 | 已交付检索诊断、有界工具修复、跨轮检查点及无可行动作停止；继续做真实链路验收 | “5 个首轮 4 个”、无效补查、错误周期、来源拒绝、MCP 超时；确认旧结果保留且不无限重跑 |
 | 4 | 记忆归纳严格终态门槛及运行可靠性 | 合成成功／降级／失败、提交失败、过时审批、重复 outbox、租约恢复与并发写入 |
 | 5 | 上线安全基线与负载控制 | 限流、队列配额、弱密钥拒绝、服务身份、防越权、审核站 Host / Origin / 上传限制、日志脱敏和依赖扫描 |
 | 6 | 真实模型、浏览器与最新 Docker 验收 | 隔离账号下 40 条人工审阅输入，每条 3 次；路由目标 ≥95%，契约与安全用例全部通过；浏览器单独记录 |
 | 7 | 人工 gold 检索与答案质量评测 | dev 校准、test 验收 Precision@5 / Recall@5 / MRR、候选召回、无答案表现和引用支持；缺标注时记录未验收 |
-| 8 | 逐 token 回复 | 带序号 `answer_delta`、断线去重、草稿提示及最终权威答案替换；先完成前述可靠性验收 |
+| 8 | 已接入流式模型及 `answer_snapshot` 草稿；补流式负载和断线恢复验收 | 带序号快照、断线去重、草稿提示、失败清除及最终权威答案替换 |
 
-以上是未来计划，不表示本次已修复业务代码。第一层交付功能回归，第二层交付真实链路，第三层交付人工质量验收，分别记录。
+以上包含已交付后的剩余验收计划；本次实现范围见“最近更新”。第一层交付功能回归，第二层交付真实链路，第三层交付人工质量验收，分别记录。
 
 ## 其他边界
 
@@ -399,7 +479,7 @@ python -m opportunity_agent.v2.evaluation.research_dataset export --dir delivera
 - 未指定年份默认 **2027**，不默认学期；这是固定默认值，不随日历自动滚动。
 - Router 仍有启发式当前查询保护和有限历史窗口；通用带来源的 Context Resolver 尚未实现，多轮条件继承需要完善。
 - 当前 PASS 后即使使用合成降级回复，也可能提交归纳任务；“模型合成成功才归纳”的更严格门槛仍需补齐。
-- SSE 提供执行进度及最终答案，**不是逐 token 回复**。
+- SSE 提供执行进度、增量回答草稿及最终答案；草稿按快照聚合，不是逐 token 独立事件，最终引用仍需校验。
 - 未加入在线评估 Agent / Answer Validator；Checker PASS 不是答案正确率证明。
 - 人工 gold 完成后单独验收 Precision@5、Recall@5、MRR、无答案表现和引用支持；真实模型、浏览器及部署需分层验收。
 - 外部模型、工具可能接收请求内容，不要在公开演示账号输入敏感资料。Research A2A 请求不携带完整画像或会话原文。

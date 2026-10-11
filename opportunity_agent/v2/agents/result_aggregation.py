@@ -48,6 +48,16 @@ class ResultAggregator:
 
     def merge_research(self, state: ExecutionState, incoming: ResearchResult) -> None:
         existing = state.research_result or ResearchResult()
+        repair_history = {v["call_id"]: v for v in [*existing.diagnostics.get("repair_history", []),
+            *incoming.diagnostics.get("repair_history", [])] if "call_id" in v}
+        old_ledger, new_ledger = existing.diagnostics.get("tool_execution", {}), incoming.diagnostics.get("tool_execution", {})
+        ledger = new_ledger if (new_ledger.get("tools_used", 0), new_ledger.get("decisions_used", 0)) >= (
+            old_ledger.get("tools_used", 0), old_ledger.get("decisions_used", 0)) else old_ledger
+        if ledger:
+            calls = {v.get("call_id") or self._key(v): v for v in [*old_ledger.get("calls", []), *new_ledger.get("calls", [])]}
+            ledger = {**ledger, "calls": list(calls.values())[-60:],
+                "tools_used": max(old_ledger.get("tools_used", 0), new_ledger.get("tools_used", 0)),
+                "decisions_used": max(old_ledger.get("decisions_used", 0), new_ledger.get("decisions_used", 0))}
         by_identity = {item.identity: item for item in existing.programs}
         for item in incoming.programs:
             prior = by_identity.get(item.identity)
@@ -64,6 +74,10 @@ class ResultAggregator:
             findings=list(findings.values()), route_history=[*existing.route_history, *incoming.route_history],
             missing_items=incoming.missing_items, errors=[*existing.errors, *incoming.errors],
             diagnostics={**existing.diagnostics, **incoming.diagnostics,
+                "repair_history": list(repair_history.values()),
+                **({"tool_execution": ledger} if ledger else {}),
+                "web_progress": {**existing.diagnostics.get("web_progress", {}),
+                                 **incoming.diagnostics.get("web_progress", {})},
                 "rounds": [*existing.diagnostics.get("rounds", [{k: v for k, v in existing.diagnostics.items() if k != "rounds"}]),
                            {k: v for k, v in incoming.diagnostics.items() if k != "rounds"}]},
         )

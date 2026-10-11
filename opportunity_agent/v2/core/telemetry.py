@@ -6,6 +6,7 @@ import os
 from typing import Iterator
 
 from opentelemetry import trace
+from opentelemetry.trace import Status, StatusCode
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.propagate import inject, extract
@@ -35,11 +36,23 @@ def span(name: str, *, carrier=None, **attributes: object) -> Iterator[object]:
     """Never attach message bodies, resume text, tokens, or other secrets."""
     configure_telemetry()
     tracer = trace.get_tracer("opportunity-agent.v2")
-    with tracer.start_as_current_span(name, context=extract(carrier) if carrier else None) as current:
+    with tracer.start_as_current_span(name, context=extract(carrier) if carrier else None,
+                                      record_exception=False, set_status_on_exception=False) as current:
         for key, value in attributes.items():
             if not any(sensitive in key.casefold() for sensitive in ("message", "content", "token", "resume", "api_key", "authorization", "query", "url")):
                 current.set_attribute(key, str(value)[:200])
-        yield current
+        try:
+            yield current
+        except BaseException as exc:
+            mark_error(current, type(exc).__name__)
+            raise
+
+
+def mark_error(current, code):
+    """Report handled failures too, without exception bodies or provider secrets."""
+    current.set_attribute("error.code", code)
+    current.set_status(Status(StatusCode.ERROR, code))
+    current.add_event("exception", {"exception.type": code})
 
 
 def trace_carrier():

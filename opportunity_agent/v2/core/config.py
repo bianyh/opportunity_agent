@@ -28,8 +28,8 @@ class Settings:
     research_a2a_url: str = os.getenv("RESEARCH_A2A_URL", "http://127.0.0.1:8772/a2a/jsonrpc/")
     planning_a2a_url: str = os.getenv("PLANNING_A2A_URL", "http://127.0.0.1:8773/a2a/jsonrpc/")
     profile_a2a_timeout_seconds: int = int(os.getenv("PROFILE_A2A_TIMEOUT_SECONDS", "90"))
-    # Research's 55s budget can expire while a bounded synchronous model call
-    # is still joining its worker thread. Allow response/loop cleanup overhead.
+    # Minimum transport timeout; A2A extends Research per request using the
+    # dynamic business allowance, including response/loop cleanup overhead.
     research_a2a_timeout_seconds: int = int(os.getenv("RESEARCH_A2A_TIMEOUT_SECONDS", "90"))
     planning_a2a_timeout_seconds: int = int(os.getenv("PLANNING_A2A_TIMEOUT_SECONDS", "120"))
 

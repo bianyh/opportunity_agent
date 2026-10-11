@@ -122,7 +122,8 @@ def test_year_only_web_target_accepts_source_supported_season(monkeypatch):
         enabled = True
 
         def generate_structured(self, *args, **kwargs):
-            return WebExtraction(intake="2027 Fall", facts=[WebFact(
+            from research_response_fixtures import structured
+            return structured(kwargs['context'], [WebFact(
                 field="gre_policy", value="optional", quote="GRE is optional.")])
 
     async def run():

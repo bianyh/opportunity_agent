@@ -1,16 +1,224 @@
 # Research Agent：运行与评测
 
+## 2026-10-10 基于工具错误的有界修复
+
+本次修复补充：HTTP 搜索结果只构造 HTTPS 候选并重新执行域名/DNS/重定向校验；
+按项目相关性排序和去重，错误专业/年份/无有效事实时优先尝试已有候选，直接读取失败先做独立计数的 MCP 备用读取。
+修复模型超时可确定性追加一次 compact 提取；连续 3 次修复服务故障会停止重复等待该服务。
+字段提取仍为每页面最多两次，连续 3 次服务故障熔断；不靠增加重复提取或放宽证据要求提高完成率。
+搜索改写会拒绝明确的学校/项目/国家/年份/学期冲突，补齐省略的任务锚点，非法改写不执行。
+候选页面提供 run/target 专属 candidate_ref，完整 URL 查询参数只保存在服务端。
+候选队列、已访问页面、待执行动作、已验证事实保存在同一 Redis Run 记录的私有进度部分；
+公开诊断和 A2A 快照不包含这些网页正文和完整 URL。中断后续查不重新搜索/读取已缓存页面。
+已无新动作或模型服务已停止时，Orchestrator 不再启动无效补查；预算和时间不重置。
+提取/修复模型不隐式注入聊天历史或画像；最终答案和前端使用统一错误分类。
+`RESEARCH_EXTRACT_MODEL` 控制字段提取，`RESEARCH_REPAIR_MODEL` 控制修复决策；必须使用现有网关支持的名称。
+`RESEARCH_PER_SCHOOL_SECONDS` 只增加时间，不增加每校 6 次工具、2 次决策上限。
+新路径的提取、发现和修复模型禁止隐式 TLS 握手重试；所有备用网络请求必须经过执行器计数。
+
+本次真实隔离冒烟（600 秒上限、原始 2027 Fall 美国 CS 硕士问题）在 288.64 秒结束：
+Trace `3148398c5869954033efda3c89f5770e`，工具 58/60，修复决策 4 次，其中 3 次超时；
+字段提取 2 次超时，累计 61.318 秒。确实执行了候选切换、MCP 备用读取及超时后的 compact 提取。
+结果仍为 PARTIAL：1 个不完整项目记录，不代表合格项目；未核实同时满足 GRE 与截止日期要求的结果。
+多页面缺乏目标入学季支持，此外模型服务仍有超时，不将“未核实”解释为“官网尚未公布”。
+冒烟不写对话、用户、知识库，预算/私有缓存仅在唯一临时 Run 键内，并已清理。
+
+默认关闭；启用后仅错误/证据不匹配触发 ResearchRepairPlanner，不重跑顶层 Router。
+工具执行器复用 Tavily MCP 和 HTTP 读取，Redis 账本跨补查轮次保存次数、失败签名、每校耗时和熔断状态。
+每校 6 次工具、2 次决策，默认 90 秒；全 Run 工具 `min(60,6×N)`、决策 `min(20,2×N)`，N 首次估算后冻结。
+所有失败与备用请求计数；内部隐式重试/输出格式降级在新路径禁用。账本不可用则安全停止外部调用。
+
+在 `.env` 设置：
+
+```dotenv
+RESEARCH_TOOL_REPAIR_ENABLED=1
+RESEARCH_PER_SCHOOL_SECONDS=90
+# 可选，必须是当前网关实际支持的模型，否则继承全局模型：
+# RESEARCH_REPAIR_MODEL=...
+```
+
+先更新 Research，再更新 API；API 必须接收新 A2A 状态并转发，最后开启开关。不要在查询进行中重建容器：
+
+```powershell
+docker compose -f docker-compose.yml -f docker-compose.research.yml build research api
+docker compose -f docker-compose.yml -f docker-compose.research.yml up -d --no-build --no-deps research
+docker compose -f docker-compose.yml -f docker-compose.research.yml up -d --no-build --no-deps api
+```
+
+CPU 环境将第二个 Compose 文件换成 `docker-compose.research.cpu.yml`。
+关闭开关后重新创建以上两个服务即可恢复旧流程；数据库和对话数据不迁移。
+SSE 展示分析失败、调整策略、备用读取及工具步数。历史诊断显示计数；成功的查询不再把已处理的工具异常当作未完成。
+安全拒绝不能通过 MCP 备用路径绕过；仍须明确匹配项目、2027 Fall 及字段原文，修复不保证未发布的信息能够找到。
+
+验证：V2 回归及额外学校/年份兼容测试通过；包含真实 Redis 原子计数测试，前端断线/进度/历史诊断测试通过。
+真实隔离查询（60 秒冒烟预算，Trace `8b1143ed207c051e11d3daed0aea6de9`）执行 5 次工具、2 次修复决策后返回 PARTIAL：
+模型提取及修复决策模型仍出现超时，HTTP 链接被明确分类为 HTTPS_REQUIRED，未获得合格项目，未伪造成功。
+180 秒探测另观察到针对 INTAKE_UNSUPPORTED 的搜索词调整。冒烟不写用户/对话/知识库，测试预算键已清理。
+
+## 2026-10-10 结构化失败诊断返回前端
+
+Run `3e5d581218bd4313bbfabc4e7ddf4bf5`（Trace `cd32c0baee82c4ffbdf713a08911ddc5`）
+执行状态是 `completed`，任务完成度却是 `PARTIAL`；不是 API 或 A2A 服务崩溃。
+
+- Brown、CMU、Northeastern 三次模型提取超时，Trace 合计 91.7 秒，业务计时 91.735 秒。
+- Brown、Georgia Tech 两次模型返回空正文、finish_reason=stop、completion_tokens=0；不是 token 截断。
+- CMU、Georgia Tech 各有一个页面未通过 HTTPS／官网域名边界校验。这不是网页连接超时。
+- Duke 两页预筛选拒绝：项目匹配 generic，原文没有目标 intake。两个耗时接近零的成功 extract span
+  代表预筛选正常返回，不代表模型成功提取事实。
+- 累计第三次提取超时后熔断；后两轮只再次检查本地数据与熔断状态，没有重复官网检索。
+  因此未获得可用于输出的 GRE 与 deadline 证据。
+
+`GET /api/v1/runs/{run_id}` 新增 `failure_report`：完成状态、结构化问题类别、次数、学校、
+提取超时累计、缺失字段及熔断状态。报告由保存的错误/诊断确定性生成，不依赖 Synthesizer 猜测。
+历史 Run 也可计算，无需重查或修改旧回答。新 Run 在合成前发 `run_diagnostics` SSE 事件；
+断线轮询也能从已存事件读取报告。重复的跨轮次熔断记录只算一次，不伪装成额外模型调用。
+不返回异常响应正文、密钥或完整堆栈。
+
+前端区分 `completed` 与业务 `PARTIAL`，后者显示“部分完成”。会话恢复时自动加载最后一次
+Run 的诊断，历史消息的“执行诊断”按钮可查看其他 Run。诊断卡独立于模型答案，学校/原因均转义。
+本次已确认无活动 Run 后仅更新 API 容器，Research/PostgreSQL/Redis 未重启；
+公开前端返回 200，未登录的 Run 请求仍为 401。
+
+## 2026-10-10 逐校进度、真实流式回答与超时隔离
+
+Run `199c4a862662477c92c8ec189d18dd88` 最终于 03:43:18 UTC 完成，约 15 分钟，
+Completion 为 `PARTIAL`，没有达到可靠来源和 2027 Fall 要求的项目。
+Trace `2b93bed7262add89f61f56dfa5757bcf` 中，运行中采样的 11 次模型提取超时为 350.1 秒；
+最终完整 Trace 是 14 次 TimeoutError、444.6 秒，另有 5 次学校预算取消、74.4 秒，
+4 次 ValueError、76.9 秒，1 次完成提取、22.7 秒。模型成功返回不等于事实通过证据校验。
+匿名合成文本探测：同一 `gpt-5.5` 网关只输入约 60 token，也耗时约 17 秒，
+并有 reasoning_tokens；真实 SSE 探测首个可见 token 为 13.33 秒。
+这证明模型服务有较高基线延迟，但不能仅凭超时断言是网关排队或服务宕机。
+另测 `reasoning_effort=none`：网关接受请求，但仍返回 37 个 reasoning token，耗时 18.54 秒，
+没有观察到关闭推理或提速，因此没有把这个参数自动写入 `.env`。
+
+新增机制：
+
+- Research 在查询本地库、逐校搜索、官网读取、备用读取、事实提取和项目处理结束时发出进度。
+  API 通过请求唯一的 Redis Stream 转发成持久化 `research_progress` 事件；不是 Agent 结果，
+  不含用户画像、查询正文、网页正文或推理过程。TTL 1 小时，最多 500 条。
+  Redis 不可用时研究继续，前端仍显示粗粒度阶段并轮询终态。
+- SSE 提供 `id`、`Last-Event-ID` / `?after=` 重放游标和 10 秒心跳，关闭代理缓冲。
+  读取后释放数据库事务；所有重放仍校验 Run 所有者。前端断线自动重连，
+  刷新对话后恢复进行中的 Run，显示当前学校/项目、阶段、补查轮次及真实耗时。
+- Synthesizer 请求模型真正的 SSE，按约 200ms 合批发送 `answer_snapshot`。
+  草稿按纯文本显示，URL 在最终引用检查之前隐藏；完成后用校验后的答案替换同一消息。
+  半途中断不重试已输出的文本，失败时 `answer_reset` 清除草稿，再使用事实摘要兜底。
+  兼容不支持流且直接返回 JSON 的网关，但不能保证这种网关有实时 token。
+- 已知项目的页面必须先通过项目身份和目标 intake 检查，再调用模型。
+  不再用模型提取明确不相关、过去年份或没有目标年份/学期的页面。
+  提取上下文从 30,000 压至最多 12,000 字符，保留项目头部与日期/GRE 原文窗口；
+  输出上限 1,000 token，仍用完整原文校验逐字引用、事实值及来源。
+- 同一 Run 累计默认 3 次提取超时/连接失败后熔断，补查轮次读取既有故障记录，
+  不再重新连接搜索服务并重复等待提取；不会把未核实结果算成成功。
+- 官网直接读取可用 `RESEARCH_WEB_PROXY`（只代理官网，不代理 A2A/数据库/模型）。
+  连接错误和 HTTP 403/429/502/503/504 可尝试 Tavily MCP extract；404、证书失败、
+  非 HTTPS、越出官网域名、非公网 DNS、过大页面等不绕过校验。
+  MCP 返回 URL 也必须明确存在并重新校验官网域名及公网 DNS。
+
+配置：
+
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `RESEARCH_PROGRESS_ENABLED` | Compose 中 1；本地默认 0 | API 与 Research 同时启用，使用同一个 Redis |
+| `RESEARCH_EXTRACT_FAILURE_LIMIT` | 3 | 同一 Run 跨轮次累计提取超时/连接失败阈值 |
+| `RESEARCH_EXTRACT_MODEL` | 沿用 `LLM_MODEL` | 可设为现有网关支持的低延迟提取模型；不改变 Router/Synthesizer |
+| `RESEARCH_EXTRACT_REASONING_EFFORT` | 不发送 | 可选 none/minimal/low 等，必须确认网关/模型支持 |
+| `RESEARCH_READ_FALLBACK` | 1 | 对限定的连接/HTTP 故障尝试 MCP extract |
+| `RESEARCH_WEB_PROXY` | 空 | 只代理官网页面读取 |
+
+本机已实测容器经 `http://host.docker.internal:7897` 访问 CMU 返回 200（1.03 秒），
+模拟直接读取连接失败后，真实 Tavily MCP extract 也返回官网正文（3.37 秒），
+已将该官网专用代理写入本机未跟踪的 `.env`。需要保持 Clash Verge 运行。
+Docker Desktop 的镜像拉取代理并不会自动变成容器内 Python 的网页读取代理。
+如果在其他机器使用此地址，先启用 Clash 允许局域网访问并从容器验证，不能假定总可用。
+没有自动改成一个未经验证的新模型，也没有重启已有服务。
+
+部署使代码生效：
+
+```powershell
+docker compose -f docker-compose.yml -f docker-compose.research.yml up -d --build --no-deps api research
+```
+
+浏览器刷新 `/v2` 后，新建一个 Run。依次应看到官网搜索/当前学校/提取、Completion 检查、
+必要时补查、正在组织语言及逐步出现的回答。断线或刷新不应丢失最终答案或增加第二条助手回答。
+熔断解决重复等待，不代表所有网络错误消失；降低模型延迟需要实测更快的提取模型。
+官网尚未公布 2027 Fall 时仍返回未核实/部分完成，不能自动采用往年政策。
+
+验证记录：全部 V2 离线回归为 **366 passed / 2 skipped**（`DOMAIN_AGENT_TRANSPORT=local`；
+显式 A2A 测试仍启动真实 Python SDK 服务）；Compose config 校验通过。
+Node DOM/EventSource 模拟测试覆盖进度、断线不误判结束、事件重放去重、恢复草稿和终态替换，
+并非真实浏览器视觉验收。真实 Redis 验证收到 search/read/extract 三个事件、TTL 为 3600，
+测试后只清理了随机测试键。真实模型 SSE 验证只使用匿名合成文本，没有重跑完整十校问题。
+这些测试验证连通性和控制逻辑，不保证模型提取质量或 2027 Fall 信息已经发布。
+
+## 2026-10-10 动态预算与缺失修复更新
+
+Research 不再让所有学校共享固定 55 秒预算。默认每轮预算为
+`min(600, max(55, 15 + 60 × 待查学校数))` 秒；同一学校的多个项目共用
+单校 60 秒额度，不按项目数重复计算。5 所学校为 315 秒，10 所为 600 秒。
+目录命中后使用真实候选学校数计算；无学校名的发现查询先按 10 所预估，
+发现学校后重新计算。调用方剩余时间和硬上限仍有优先权。
+
+Orchestrator 的完整请求预算为 `min(1800, 180 + 每轮 Research 预算 × 3)`，
+最多三轮（首次加两次补查），为 Synthesizer 预留其预算加 5 秒。
+A2A 的请求等待时间及 HTTP 读取超时同步扩展；Run 租约覆盖完整请求上限
+加清理余量，避免长查询被调度器重复执行。闲聊仍不执行 Research。
+
+可在 `.env` 中调整，Compose 同时传给 API 和 Research：
+
+| 参数 | 默认值 | 含义 |
+|---|---:|---|
+| `RESEARCH_PER_SCHOOL_SECONDS` | 60 | 单校每轮额度 |
+| `RESEARCH_OVERHEAD_SECONDS` | 15 | 目录查询／发现等公共开销 |
+| `RESEARCH_MAX_BUDGET_SECONDS` | 600 | 单轮 Research 上限，最大支持 3600 |
+| `RESEARCH_DISCOVERY_SCHOOL_COUNT` | 10 | 尚不知道学校数时的预估 |
+| `RESEARCH_EXTRACT_TIMEOUT_SECONDS` | 30 | 单次 LLM 字段提取超时 |
+| `RESEARCH_TARGET_MAX_ATTEMPTS` | 3 | 一个学校／项目／入学季的尝试上限 |
+| `EXECUTION_OVERHEAD_SECONDS` | 180 | 路由、其他 Agent、最终回答的余量 |
+| `EXECUTION_MAX_BUDGET_SECONDS` | 1800 | 完整请求上限，最大支持 3600 |
+
+本地直接运行时，旧 `RESEARCH_BUDGET_SECONDS` 若设置，仍作为显式总上限。
+Compose 使用新的 `RESEARCH_MAX_BUDGET_SECONDS`，不再硬编码 55 秒。
+扩大总预算不能保证任意学校都成功；网络、单次模型超时、页面／搜索次数
+及学校已公布的入学季信息仍是约束。不降低年份、来源或字段证据门槛。
+
+单个搜索、页面读取或提取失败会记录目标和阶段，并继续其他目标。每轮
+`diagnostics.web_progress` 保留尝试次数、页面摘要 ID 和失败阶段，由
+Orchestrator 保存，通过 A2A 的独立元数据传给下一轮；不传用户画像或整份
+Research 结果。补查优先未尝试目标，不再次提取处理过的同一页面；旧结果
+仍由 Aggregator 保留和合并。中文“计算机硕士”按 CS 项目族筛选，排除 ECE。
+
+Jaeger 新增 `research.web.target`、`research.page.read`、
+`research.page.extract` 和 `research.discovery.extract`；失败会标记 ERROR，
+只记录异常类型、目标／页面 ID，不导出网页正文、密钥或异常响应内容。
+最终回复区分搜索、网页读取、LLM 提取、总预算耗尽，不能把提取超时说成官网不可访问。
+
+更新已有 GPU 部署（数据库和模型缓存保留）：
+
+```powershell
+docker compose -f docker-compose.yml -f docker-compose.research.yml up -d --build --no-deps api research
+```
+
+CPU 部署改用 `docker-compose.research.cpu.yml`，不要混用两个 overlay。
+预算调整也必须重建／重新创建 API 和 Research，不能只修改宿主机环境变量。
+离线回归：
+
+```powershell
+.\.venv-research\Scripts\python.exe -m pytest tests/test_v2_research_budget_repairs.py tests/test_v2_research.py tests/test_v2_research_multi_target.py -q
+```
+
 ## 2026-10-08 Router 与诊断入口更新
 
 当前明确学校／项目及字段的请求优先于旧历史；Router 使用请求级 JSON Schema 与返回后校验，提供格式分类、有限重试与窄范围恢复。前端展示 Run/Trace 并持久显示失败。Docs 中可用 `GET /api/v1/conversations/{conversation_id}/runs` 查会话历史任务，再用 `GET /api/v1/runs/{run_id}` 查看 route_decision、routing_diagnostics 和结果。消息 ID、Run ID、Trace ID 是三个不同标识。
 
-Research A2A 默认 90 秒，Research 业务预算仍为 55 秒，整轮预算 180 秒。见 [Router 修复与验收记录](../deliverables/research/router-20261008-report.md)。真实历史上下文外发重放须用户授权；本轮真实模型只验证无个人资料的公开测试句。
+当时 Research A2A 默认 90 秒，Research 业务预算为 55 秒，整轮预算 180 秒；已被上面的动态预算取代。见 [Router 修复与验收记录](../deliverables/research/router-20261008-report.md)。真实历史上下文外发重放须用户授权；本轮真实模型只验证无个人资料的公开测试句。
 
 ## 2026-10-08 多目标查询更新
 
 Research 支持多学校、多项目类型及明确学校／项目配对；GRE 等已识别字段不再因单值学校为空而等待模型。未指定入学年份默认 2027，不默认学期。项目缩写与库内英文全称采用严格学位映射，MSCS、MCS、CSE 不混同。
 
-MCP 按缺失目标轮转并共享页面预算，整体执行预算不变。目录候选命中不等于 GRE 字段已经核验，未知或待审核政策仍不能用于可靠结论。最新功能回归与实际数据库复核见 [多目标修复报告](../deliverables/research/multi-target-20261008-report.md)。
+当时 MCP 按缺失目标轮转并共享页面预算；现在另有动态时间预算和跨轮进度。目录候选命中不等于 GRE 字段已经核验，未知或待审核政策仍不能用于可靠结论。最新功能回归与实际数据库复核见 [多目标修复报告](../deliverables/research/multi-target-20261008-report.md)。
 
 ## 2026-10-07 运行状态更新
 
@@ -100,7 +308,7 @@ CPU 构建应输出 `CUDA build: None`、`CUDA available: False`；模型检查�
 `device=cpu` 和 `embedding_dimension=384`。导入真实知识后再测试检索。
 Reranker 的语义质量门槛仍需要人工 dev 集校准文件
 `deliverables/research/calibration.json`；缺少校准不能当作质量通过。
-CPU 延迟可能耗尽现有业务预算，先测真实耗时，不自动扩大请求超时。
+CPU 延迟可能耗尽按学校计算的预算，先测真实耗时，再按上面的配置调整单校额度。
 这次配置不为 API 安装偏好向量依赖，偏好仍默认使用规则召回。
 
 ### GPU 模式（后续提速）
@@ -356,6 +564,12 @@ python -m opportunity_agent.v2.evaluation.research_dataset llm-batch --batch-id 
 ```
 
 内部 `relevance=0/1/2` 对应前端按键 `1/2/3`；`null` 代表不确定并且必须请求人工复核。等级2需要有效项目范围、可靠来源和原文引用；等级0/1/null的支持字段为空。`needs_human_review` 是疑点标记，false不表示人工已确认。`validate_llm_response(request, response)` 可检查ID覆盖、重复、claim归属及引用确实存在于原片段；它不判断语义标签是否正确。所有机器输出保持 `llm_proposed`，此次功能不自动导入人工审核表，也不放宽正式金标准的导出规则。提示词全文在导出文件中，可直接复制；调用方另行记录实际使用的模型版本。
+## 在线检索的入学季适用性
+
+官网没有写目标入学季不再阻止字段提取。无入学季的页面仍须通过官方域名、项目身份、逐字引用和字段值校验；有效证据标记 `temporal_scope=current_policy`、`intake=""`，可参与筛选，但回答必须注明“当前官网信息，适用入学季未确认”。页面明确标注不匹配的入学季仍拒绝；不能仅用版权年份或截止日期年份证明入学季，也不能因为刚读取就把旧日期当作新日期。
+
+完整截止日期支持 `Dec. 9, 2026` 等月份缩写；缺年份不能补猜，当前/未来申请查询不接受已过期日期。证据适用性通过现有 requirement qualifier 的版本前缀在缓存中保留，无数据库结构迁移，GRE SQL 筛选兼容旧记录。最终合成及确定性降级回答都展示未确认入学季的标注。MSCS 与 MSAII 仍按独立项目处理，GRE required 的项目不符合“GRE 不要求”。
+
 # LLM 预标注复核（本地、独立数据层）
 
 原 evidence 与 LLM 复核页都使用本地 Markdown 阅读组件：表格、标题、列表、引用和代码块，

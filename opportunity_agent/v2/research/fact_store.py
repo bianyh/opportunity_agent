@@ -11,10 +11,10 @@ from ...official_research import OfficialDomainRegistry, DynamicDomainCache, cla
 from ..db.models import OfficialSource, ResearchProgram, ResearchRequirement
 from .identity import school_aliases, program_aliases, canonical_school, canonical_program, normalize_intake
 from .normalization import supported_value
-from .task import intake_supported
+from .temporal import source_intake, expired_current_deadline, CURRENT_POLICY_PREFIX
 
 
-async def persist_verified_page(session, program, page, facts, *, require_explicit_intake=True):
+async def persist_verified_page(session, program, page, facts):
     """Write in the caller's short transaction; never commit unrelated work."""
     university, name, intake = program.university, program.program, normalize_intake(program.intake)
     url, title, body = page["url"], page["title"], page["text"]
@@ -25,16 +25,27 @@ async def persist_verified_page(session, program, page, facts, *, require_explic
             and parsed.port in {None, 443} and any(host == d or host.endswith("." + d) for d in record["domains"])):
         raise ValueError("Fact persistence requires a verified official HTTPS source")
     match, _, _ = classify_program_page(name, title, url, body)
-    intake_is_explicit = intake_supported(intake, body)
-    if match != "exact" or (require_explicit_intake and not intake_is_explicit):
-        raise ValueError("Official page persistence requires an exact programme and the requested intake scope")
-    if facts and not intake_is_explicit:
-        raise ValueError("Structured facts require an intake explicitly supported by the source")
+    semantic = bool(facts) and all(f.get("provenance", {}).get("version") for f in facts)
+    observed_intake = "" if semantic else source_intake(intake, body)
+    if not semantic and match != "exact":
+        raise ValueError("Fact persistence requires an exact programme")
     for fact in facts:
+        if semantic:
+            from .extraction import AdmissionFact, verify_fact
+            extracted = AdmissionFact.model_validate(fact["provenance"]["fact"])
+            proof, reason = verify_fact(extracted, program, page, [fact["field"]], date.today())
+            if (reason or (proof and proof.get('year_status') == 'unknown')
+                    or extracted.field != fact["field"] or extracted.value != fact["value"]
+                    or extracted.quote != fact["quote"]):
+                raise ValueError("Semantic observation failed independent persistence verification")
+            fact["provenance"] = proof
+            continue
         if (fact["field"] not in {"deadline", "gre_policy", "tuition", "language"}
                 or not fact["quote"] or fact["quote"] not in body
-                or not supported_value(fact["field"], fact["value"], fact["quote"])):
+                or not supported_value(fact["field"], fact["value"], fact["quote"], intake)):
             raise ValueError("Fact does not match its source quote")
+        if fact["field"] == "deadline" and expired_current_deadline(fact["value"], intake, date.today()):
+            raise ValueError("A past deadline cannot represent a current application cycle")
 
     # Programme locks cover aliases; URL locks also protect shared source rows.
     if session.bind.dialect.name == "postgresql":
@@ -78,15 +89,22 @@ async def persist_verified_page(session, program, page, facts, *, require_explic
             if not any(old.content_hash == digest and old.value == f["value"] and old.excerpt == f["quote"] for f in values.values()):
                 old.status = "superseded"
         for fact in values.values():
+            qualifier = fact["value"] if field == "gre_policy" else fact.get("qualifier", "")
+            if not (fact["provenance"]["intake"] if semantic else observed_intake):
+                qualifier = CURRENT_POLICY_PREFIX + qualifier
+            qualifier = qualifier[:64]
             prior = next((o for o in active if o.content_hash == digest and o.value == fact["value"] and o.excerpt == fact["quote"]), None)
             if prior:
                 prior.verified_at, prior.expires_at = now, expires
+                prior.qualifier = qualifier
+                prior.extraction_provenance = fact.get("provenance", {})
                 refreshed += 1
             else:
                 session.add(ResearchRequirement(program_id=row.id, source_id=source.id, field=field,
                     value=fact["value"], date_value=date.fromisoformat(fact["value"]) if field == "deadline" else None,
-                    qualifier=fact["value"] if field == "gre_policy" else fact.get("qualifier", ""),
+                    qualifier=qualifier,
                     excerpt=fact["quote"], content_hash=digest, verified_at=now, expires_at=expires,
+                    extraction_provenance=fact.get("provenance", {}),
                     status="verified", program_match="exact"))
                 written += 1
     await session.flush()

@@ -59,6 +59,7 @@ class LLMClient:
             raise ValueError("invalid structured output mode")
         self._completion_metadata: ContextVar[CompletionMessage | None] = ContextVar("completion_metadata", default=None)
         self._request_budget: ContextVar[tuple] = ContextVar("request_budget", default=(None, None))
+        self.reasoning_effort: str | None = None
 
     @property
     def enabled(self) -> bool:
@@ -129,6 +130,8 @@ class LLMClient:
             payload["enable_thinking"] = thinking
         if response_format:
             payload["response_format"] = response_format
+        if self.reasoning_effort:
+            payload["reasoning_effort"] = self.reasoning_effort
         # ``retries`` applied only to generate_structured, so a plain text caller
         # such as the Synthesizer silently had a single attempt. Transport errors
         # are retried here too; a refusal or bad request is raised on first sight.
@@ -164,6 +167,98 @@ class LLMClient:
         finally:
             self._request_budget.reset(budget_token)
 
+    def generate_stream(self, *, on_delta, **kwargs) -> str:
+        """Real provider SSE. Retry only before visible text, never duplicate a draft."""
+        if self.completion_fn:
+            answer = self.generate(**kwargs)
+            on_delta(answer)
+            return answer
+        if not self.api_key:
+            raise RuntimeError("LLM API key is not configured")
+        deadline, cancel = kwargs.get("deadline"), kwargs.get("cancel_event")
+        payload = inject_conversation({"model": self.model, "stream": True,
+            "temperature": kwargs.get("temperature", .15), "max_tokens": kwargs.get("max_tokens", 1800),
+            "messages": [{"role": "system", "content": kwargs["system"]}, {"role": "user", "content": kwargs["user"]}]})
+        if "qwen" in self.model.casefold():
+            payload["enable_thinking"] = kwargs.get("thinking", False)
+        if self.reasoning_effort:
+            payload["reasoning_effort"] = self.reasoning_effort
+        if kwargs.get("response_format"):
+            payload["response_format"] = kwargs["response_format"]
+        diagnostics = kwargs.get("diagnostics")
+        for attempt in range(1, self.retries + 2):
+            _check_budget(deadline, cancel)
+            started, parts, usage = time.monotonic(), [], None
+            entry = {"attempt": attempt, "streaming": True}
+            try:
+                request = Request(self.base_url, data=json.dumps(payload, ensure_ascii=False).encode(),
+                    headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json", "Accept": "text/event-stream"}, method="POST")
+                timeout = min(self.timeout_seconds, max(.001, deadline-time.monotonic())) if deadline else self.timeout_seconds
+                with open_modelscope_request(request, timeout=timeout, retry_handshake=self.tls_compatibility_retry) as response:
+                    content_type = response.headers.get("content-type", "")
+                    if "text/event-stream" not in content_type:
+                        body = json.loads(response.read(2 * 1024 * 1024).decode())
+                        message = _completion_message({"message": body["choices"][0].get("message", {}), "usage": body.get("usage")})
+                        if body["choices"][0].get("finish_reason") not in {None, "stop"}:
+                            raise ValueError("buffered model output did not finish normally")
+                        _check_budget(deadline, cancel)
+                        parts.append(message.content)
+                        on_delta(message.content)
+                        usage = message.usage
+                        entry["provider_buffered"] = True
+                    else:
+                        ended = False
+                        while True:
+                            _check_budget(deadline, cancel)
+                            line = response.readline(262145)
+                            _check_budget(deadline, cancel)
+                            if not line:
+                                break
+                            if len(line) > 262144:
+                                raise ValueError("model stream frame exceeds limit")
+                            if not line.startswith(b"data:"):
+                                continue
+                            frame = line[5:].strip()
+                            if frame == b"[DONE]":
+                                ended = True
+                                break
+                            if not frame:
+                                continue
+                            body = json.loads(frame)
+                            if body.get("error"):
+                                raise RuntimeError("model stream returned an error")
+                            usage = body.get("usage") or usage
+                            for choice in body.get("choices", []):
+                                if choice.get("index", 0) != 0:
+                                    continue
+                                delta = choice.get("delta", {}).get("content")
+                                if isinstance(delta, str) and delta:
+                                    if not parts:
+                                        entry["first_token_ms"] = round((time.monotonic()-started)*1000)
+                                    parts.append(delta)
+                                    if sum(map(len, parts)) > 100000:
+                                        raise ValueError("model stream text exceeds limit")
+                                    on_delta(delta)  # Never emit reasoning/tool-call deltas.
+                                if choice.get("finish_reason"):
+                                    reason = choice["finish_reason"]
+                                    if reason != "stop":
+                                        raise ValueError("model stream did not finish normally")
+                                    ended = True
+                        if not ended:
+                            raise RuntimeError("model stream disconnected before completion")
+                _check_budget(deadline, cancel)
+                entry.update(status="ok", usage=_safe_usage(usage), content_chars=sum(map(len, parts)))
+                return "".join(parts)
+            except Exception as exc:
+                entry.update(status="failed", error_code=type(exc).__name__)
+                if parts or attempt > self.retries or not isinstance(exc, (HTTPError, URLError, TimeoutError, OSError)) or _is_client_error(exc):
+                    raise
+            finally:
+                entry["latency_ms"] = round((time.monotonic()-started)*1000)
+                if diagnostics is not None:
+                    diagnostics.append(entry)
+            _retry_pause(deadline, cancel)
+
     def generate_structured(
         self,
         model_type: type[T],
@@ -176,6 +271,7 @@ class LLMClient:
         diagnostics: list[dict[str, Any]] | None = None,
         cancel_event: Any = None,
         deadline: float | None = None,
+        allow_format_fallback: bool = True,
     ) -> T:
         last_error: Exception | None = None
         user = json.dumps({"context": context, "output_schema": model_type.model_json_schema()}, ensure_ascii=False)
@@ -216,7 +312,7 @@ class LLMClient:
                     entry["http_status"] = exc.code
                 if diagnostics is not None:
                     diagnostics.append(entry)
-                if mode != "prompt" and _unsupported_output_format(exc):
+                if allow_format_fallback and mode != "prompt" and _unsupported_output_format(exc):
                     mode = "json_object" if mode == "json_schema" else "prompt"
                     entry["error_code"] = "unsupported_output_format"
                     continue  # Each mode is tried at most once before normal retry.
@@ -248,6 +344,15 @@ def safe_error_details(exc):
     detail = {"code": type(exc).__name__}
     if isinstance(exc, HTTPError):
         detail["http_status"] = exc.code
+    elif type(exc).__name__ == "HTTPStatusError":
+        detail["http_status"] = exc.response.status_code
+    reasons = {"Page left verified official domains": "official_domain_boundary",
+        "Extract URL left verified official domains": "official_domain_boundary",
+        "Official page exceeds 2 MiB": "page_size_limit",
+        "Too many official page redirects": "redirect_limit",
+        "structured output is empty": "empty_content", "structured output reached token limit": "truncated_output"}
+    if isinstance(exc, ValueError) and exc.args and exc.args[0] in reasons:
+        detail["reason"] = reasons[exc.args[0]]
     if isinstance(exc, BaseExceptionGroup):
         detail["causes"] = [safe_error_details(e) for e in exc.exceptions[:5]]
     return detail

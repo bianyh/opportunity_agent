@@ -8,6 +8,7 @@ import uuid
 from pathlib import Path
 
 import httpx
+from opportunity_agent.v2.core.research_budget import execution_limit
 
 
 async def main():
@@ -15,7 +16,11 @@ async def main():
     parser.add_argument("--base-url", default="http://localhost:8000")
     parser.add_argument("--jaeger-url", default="http://localhost:16686")
     parser.add_argument("--output", required=True)
+    parser.add_argument("--run-timeout", type=float, default=execution_limit() + 180,
+                        help="Maximum seconds to wait for a dynamically budgeted Run")
     args = parser.parse_args()
+    if args.run_timeout <= 0:
+        parser.error("--run-timeout must be positive")
     report = {}
     async with httpx.AsyncClient(base_url=args.base_url, timeout=30, trust_env=False) as client:
         identity = uuid.uuid4().hex
@@ -28,7 +33,7 @@ async def main():
             json={"message": "如果我不考虑GRE，会有什么影响？", "request_id": identity})
         response.raise_for_status()
         run_id = response.json()["run_id"]
-        deadline = time.monotonic() + 240
+        deadline = time.monotonic() + args.run_timeout
         while time.monotonic() < deadline:
             response = await client.get("/api/v1/runs/" + run_id)
             response.raise_for_status()
@@ -36,7 +41,9 @@ async def main():
             if run["status"] in {"completed", "failed"}:
                 break
             await asyncio.sleep(1)
-        events = await client.get("/api/v1/runs/" + run_id + "/events", timeout=240)
+        if run["status"] not in {"completed", "failed"}:
+            raise TimeoutError(f"Run {run_id} did not finish within --run-timeout")
+        events = await client.get("/api/v1/runs/" + run_id + "/events", timeout=args.run_timeout)
         events.raise_for_status()
         route = None
         for block in events.text.split("\n\n"):

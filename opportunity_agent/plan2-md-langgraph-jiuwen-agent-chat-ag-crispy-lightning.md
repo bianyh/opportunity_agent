@@ -159,6 +159,22 @@ async for agent_result in client.stream({"query": request_json, "conversation_id
 
 ## ExecutionState、完成检查与缺失修复
 
+### Research 工具级有界修复（实现开关：`RESEARCH_TOOL_REPAIR_ENABLED`）
+
+保留首轮 SQL/RAG/Hybrid/MCP-Web 流程。失败、无结果或项目/入学季证据不匹配时，ResearchRepairPlanner 读取结构化 ToolObservation，提议一个工具和参数；统一执行器校验权限、来源和预算再调用。顶层 Router 不参与工具决策。
+
+- 工具为 `search_official_pages`、`validate_official_url`、`read_official_page`、`extract_official_page`、`extract_program_facts`；复用 Tavily MCP，不添加浏览器/PDF或新 MCP 服务。直接读取和备用 MCP 提取分别计数。
+- 每校最多 6 次工具、2 次修复决策，默认 90 秒（显式环境变量覆盖）；全 Run 为 `min(60,6×N)` 次工具及 `min(20,2×N)` 次决策。N 首次估算并冻结；Research/执行总时间上限仍为 600/1800 秒，预留合成时间。
+- Redis Run 级账本请求前原子扣减；成功、失败、格式降级、备用请求均不能绕过计数。账本故障则停止外部调用。Research A2A 转发 `research_tool_state`，ResultAggregator 按调用 ID 去重，不重加累计快照。
+- 修复模型最多等待 20 秒，无隐式重试；失效时采用安全备用读取、一次 compact 提取或继续已有合法候选，再进行有界字段拆分搜索；连续 3 次修复服务故障后暂停该服务等待。简化提取最多 4000 字符、两个缺失字段；同页最多一次额外提取，必须更改档位或字段。统一执行器对所有入口禁止原样重复提取；其他工具的瞬时故障最多一次原参数重试。
+- 查询改写须保持当前学校、项目、国家、年份/学期和 GRE 筛选目标；拒绝明确冲突并补齐省略的任务锚点。候选按项目相关性排序，HTTP 仅构造 HTTPS 候选重新校验；错误专业/年份优先转到已有候选，受控备用读取不等待 LLM。
+- Redis Run 账本私有进度压缩保存候选、完整 URL、原始页面、待执行动作及已验证结果，公开快照只传递计数与安全状态；跨轮次续查不重启相同搜索。提取和修复模型不隐式注入聊天历史/画像。没有新动作时 Orchestrator 提前 PARTIAL，前端及 Synthesizer 使用统一的精确失败分类。
+- 官网边界拒绝明确区分协议/域名/端口/私网/重定向；LLM 不得放宽来源、安全策略或改写目标年份。取消“官网页面必须出现目标入学季”的硬门槛：无入学季的当前官方政策可用于筛选，但证据标记 `temporal_scope=current_policy`、来源入学季留空，回答说明“适用入学季未确认”；检索日期不能证明适用年份。明确标注其他入学季的页面仍拒绝，截止日期须有可核对的完整年份、支持月份缩写，当前/未来申请查询不能把已过期截止日期当作新日期。该区别须在缓存回读和 Synthesizer 中保留，不增加数据库迁移。模型连续三次超时/连接失败触发熔断；全 Run 最多一次、等待至少 30 秒的半开探测。
+- 工具级修复不等于 Checker PASS。Orchestrator 仍保留所有已验证结果，只补缺口；工具预算耗尽后 PARTIAL，由 Synthesizer 如实说明。技术故障不得伪装成需要用户提供官网事实。
+- SSE 显示失败分析、策略调整、备用读取及工具步数；Trace 和历史诊断保存安全错误码与计数，不记录密钥、完整网页或模型思维过程。默认关闭，先部署 Research 再部署 API 后启用；无需数据库迁移。
+
+验收覆盖搜索改写、403 备用读取、空响应/超时简化提取、非法提议、来源拒绝、熔断及跨轮次计数；已有 4 个合格项目时只补第 5 个，不合格证据不计数，预算耗尽诚实返回缺口。
+
 `ExecutionState` 归 Orchestrator 持有，按 `run_id` 保存原始用户目标、`SuccessCriteria`（纯闲聊可为空）、`RouteDecision`、每轮 Agent 结果、已接受的证据、轮数/时间预算及缺失任务。Result Aggregation & Context Builder 对领域结果按项目身份去重、保留来源与版本，生成给 Checker / Synthesizer 使用的当前汇总视图。**Completion Checker 不持有或缓存旧结果**，每次只读取该视图和成功标准；`direct_reply` 不调用 Checker，也不伪造 `PASS`。
 
 Checker 第一版只做可操作的完成判断：被选中的 Agent 是否返回有效结构化结果、学校/项目数量、明确的日期范围、GRE 等结构化约束，以及证据来源是否可追溯、适用该项目、足够新且与查询高度相关。来源可靠性依官方域名、项目级匹配、抓取时间和证据标识校验；相关性依检索/重排分数与所问字段是否匹配。阈值在离线样例上校准并作为配置记录；缺来源、来源被拒绝、低相关或未知值均**不计为合格项**。Checker 不评价答案文风，也不把宽泛的“AI 强”直接变成主观通过/失败判定。

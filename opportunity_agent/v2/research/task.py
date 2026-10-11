@@ -22,12 +22,15 @@ class ResearchEntities(BaseModel):
     model_config = ConfigDict(extra="forbid")
     university: str = ""
     program: str = ""
+    degree: Literal['', 'masters', 'doctoral', 'bachelors'] = ''
+    home_unit: str = ''
     intake: str = ""
     country: str = ""
     universities: list[str] = Field(default_factory=list)
     programs: list[str] = Field(default_factory=list)
     countries: list[str] = Field(default_factory=list)
     targets: list[ResearchTarget] = Field(default_factory=list)
+    program_family: Literal["", "computer_science"] = ""
 
 
 class SemanticParse(BaseModel):
@@ -52,6 +55,7 @@ class ResearchTaskSpec(BaseModel):
     as_of: date = Field(default_factory=date.today)
     routing_diagnostics: dict = Field(default_factory=dict)
     intake_defaulted: bool = False
+    research_progress: dict = Field(default_factory=dict)
 
     @property
     def route(self) -> str:
@@ -75,6 +79,7 @@ def parse_task(request, catalogue=(), llm=None) -> ResearchTaskSpec:
     criteria = (request.success_criteria or SuccessCriteria()).model_copy(deep=True)
     task = ResearchTaskSpec(query=query, structured_filters=criteria,
         target_count=criteria.required_program_count,
+        research_progress=getattr(request, "research_progress", {}),
         freshness_required=bool(re.search(r"最新|今年.*(?:改|官网)|重新核验|latest|up.to.date|recheck", lower)))
     for country, pattern in {"US": r"美国|united states|(?<![a-z])usa(?![a-z])", "CA": r"加拿大|canada",
                              "UK": r"英国|united kingdom", "AU": r"澳大利亚|australia"}.items():
@@ -129,6 +134,8 @@ def parse_task(request, catalogue=(), llm=None) -> ResearchTaskSpec:
         task.entities.program = next(iter(programs))
     task.entities.universities = sorted(schools)
     task.entities.programs = sorted(programs)
+    if not programs and re.search(r"计算机(?:科学)?(?:专业)?硕士|计算机科学|computer science", lower):
+        task.entities.program_family = "computer_science"
     # Preserve explicit local pairings, e.g. CMU MSCS、UIUC MCS. Only
     # use pair restrictions when every named school is paired in its clause;
     # school lists followed by a shared programme list remain independent scope.

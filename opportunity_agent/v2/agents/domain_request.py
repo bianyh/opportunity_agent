@@ -18,6 +18,9 @@ class DomainRequest(Protocol):
     success_criteria: SuccessCriteria | None
     missing_task: MissingTask | None
     remaining_budget_seconds: float
+    research_progress: dict[str, Any]
+    research_tool_state: dict[str, Any]
+    progress_channel: str
     profile_payload: dict[str, Any]
     profile_version: int
     profile_facts: list[dict[str, Any]]

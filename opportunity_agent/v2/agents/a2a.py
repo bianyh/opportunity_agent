@@ -10,9 +10,9 @@ import asyncio
 import os
 import json
 import logging
-import os
 import signal
 import time
+import uuid
 from collections.abc import Mapping
 from typing import Any, Literal
 
@@ -20,6 +20,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from ..core.config import settings
 from ..core.telemetry import span, trace_carrier
+from ..core.research_budget import research_limit, research_seconds, estimate_school_count, synthesis_reserve
 from .contracts import (
     AgentName,
     MissingTask,
@@ -53,7 +54,10 @@ class DomainA2ARequest(BaseModel):
     conversation_context: dict[str, Any] = Field(default_factory=dict)
     success_criteria: SuccessCriteria | None = None
     missing_task: MissingTask | None = None
-    remaining_budget_seconds: float = Field(default=55, gt=0, le=600)
+    remaining_budget_seconds: float = Field(default=600, gt=0, le=3600)
+    research_progress: dict[str, Any] = Field(default_factory=dict)
+    research_tool_state: dict[str, Any] = Field(default_factory=dict)
+    progress_channel: str = Field(default="", pattern=r"^(?:[a-f0-9]{32})?$")
     round_id: int = Field(default=0, ge=0)
     trace_context: dict[str, str] = Field(default_factory=dict)
     # Profile and Planning may need an explicit user-owned profile summary.
@@ -69,6 +73,11 @@ class DomainA2ARequest(BaseModel):
     relevant_memory: dict[str, Any] = Field(default_factory=dict)
     preference_memory: dict[str, Any] = Field(default_factory=dict)
     turn_preferences: list[dict[str, Any]] = Field(default_factory=list)
+
+    def wire_json(self) -> str:
+        # Only Research consumes new repair metadata. Keep Profile/Planning's
+        # existing strict wire schema compatible during a rolling deployment.
+        return self.model_dump_json(exclude={"research_progress", "research_tool_state", "progress_channel"} if self.agent != "research" else None)
 
     @model_validator(mode="after")
     def validate_agent_scope(self) -> "DomainA2ARequest":
@@ -105,7 +114,15 @@ def request_from_state(
     """Make the least-privilege request allowed for the destination agent."""
 
     has_snapshot = agent in {"profile", "planning"}
+    query = (state.route_decision.resolved_query if agent != "profile" and state.route_decision
+             and state.route_decision.resolved_query else state.message)
+    allowance = research_seconds(estimate_school_count(query,
+        state.success_criteria.required_program_count if state.success_criteria else None)) if agent == "research" else 55.
+    if getattr(state, "_execution_deadline", None):
+        allowance = min(allowance, state._execution_deadline - time.monotonic()
+                        - (synthesis_reserve() if agent == "research" else 0))
     return DomainA2ARequest(
+        progress_channel=uuid.uuid4().hex if agent == "research" and os.getenv("RESEARCH_PROGRESS_ENABLED", "0") == "1" else "",
         agent=agent,
         user_id=state.user_id,
         conversation_id=state.conversation_id,
@@ -118,8 +135,11 @@ def request_from_state(
         success_criteria=state.success_criteria,
         missing_task=missing_task,
         round_id=state.round_id,
-        remaining_budget_seconds=max(.01, min(55., state._execution_deadline - time.monotonic()))
-            if getattr(state, "_execution_deadline", None) else 55.,
+        remaining_budget_seconds=max(.01, min(3600., allowance)),
+        research_progress=dict(state.research_result.diagnostics.get("web_progress", {}))
+            if agent == "research" and state.research_result else {},
+        research_tool_state=dict(state.research_result.diagnostics.get("tool_execution", {}))
+            if agent == "research" and state.research_result else {},
         trace_context=trace_carrier(),
         profile_payload=dict(state.profile_payload) if has_snapshot else {},
         profile_version=state.profile_version if has_snapshot else 1,
@@ -184,14 +204,16 @@ class RustOpenJiuwenDomainAgents:
         if not endpoint:
             raise DomainAgentUnavailable(f"no A2A endpoint configured for {agent}")
         request = request_from_state(agent, state, missing_task)
-        wire = json.dumps({"query": request.model_dump_json(), "conversation_id": request.conversation_id}, ensure_ascii=False)
+        wire = json.dumps({"query": request.wire_json(), "conversation_id": request.conversation_id}, ensure_ascii=False)
         client = await self._client_for(endpoint)
-        timeout = self.timeouts.get(agent, 60.0)
+        timeout = max(self.timeouts.get(agent, 60.0), request.remaining_budget_seconds + 10) if agent == "research" else self.timeouts.get(agent, 60.0)
         try:
-            with span("a2a.domain_call", agent=agent, run_id=request.run_id, endpoint=endpoint):
-                raw = await asyncio.wait_for(
-                    asyncio.to_thread(client.send_message, wire, timeout), timeout=timeout + 5,
-                )
+            from ..core.progress import relay_progress
+            async with relay_progress(request, state):
+                with span("a2a.domain_call", agent=agent, run_id=request.run_id, endpoint=endpoint):
+                    raw = await asyncio.wait_for(
+                        asyncio.to_thread(client.send_message, wire, timeout), timeout=timeout + 5,
+                    )
             envelope = DomainA2AResponse.model_validate_json(raw)
         except DomainAgentUnavailable:
             raise
@@ -277,7 +299,8 @@ class PythonOpenJiuwenDomainAgents:
                 from a2a.client import ClientConfig, ClientFactory
                 import httpx
                 await client.stop()
-                transport = httpx.AsyncClient(timeout=httpx.Timeout(self.timeouts.get(agent, 60.0), connect=10.0))
+                read_timeout = max(self.timeouts.get(agent, 60.0), research_limit() + 10) if agent == "research" else self.timeouts.get(agent, 60.0)
+                transport = httpx.AsyncClient(timeout=httpx.Timeout(read_timeout, connect=10.0))
                 try:
                     client.client = ClientFactory(ClientConfig(httpx_client=transport)).create(client.card)
                 except BaseException:
@@ -297,13 +320,15 @@ class PythonOpenJiuwenDomainAgents:
             raise DomainAgentUnavailable(f"no A2A endpoint configured for {agent}")
         request = request_from_state(agent, state, missing_task)
         client = await self._client_for(agent, endpoint)
-        timeout = self.timeouts.get(agent, 60.0)
+        timeout = max(self.timeouts.get(agent, 60.0), request.remaining_budget_seconds + 10) if agent == "research" else self.timeouts.get(agent, 60.0)
         try:
-            with span("a2a.domain_call", agent=agent, run_id=request.run_id, endpoint=endpoint, backend="python"):
-                result = await asyncio.wait_for(
-                    client.invoke({"query": request.model_dump_json(), "conversation_id": request.conversation_id}),
-                    timeout=timeout,
-                )
+            from ..core.progress import relay_progress
+            async with relay_progress(request, state):
+                with span("a2a.domain_call", agent=agent, run_id=request.run_id, endpoint=endpoint, backend="python"):
+                    result = await asyncio.wait_for(
+                        client.invoke({"query": request.wire_json(), "conversation_id": request.conversation_id}),
+                        timeout=timeout,
+                    )
             envelope = _python_envelope(result)
         except DomainAgentUnavailable:
             raise

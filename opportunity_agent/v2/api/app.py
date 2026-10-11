@@ -305,7 +305,8 @@ async def execute_run(run_id: str, user_id: str, conversation_id: str, message: 
     async with SessionLocal() as session:
         repo = Repository(session)
         token = uuid.uuid4().hex
-        if not await repo.claim_run(run_id, token):
+        from ..core.research_budget import execution_limit
+        if not await repo.claim_run(run_id, token, lease_seconds=int(execution_limit()) + 180):
             await session.rollback()
             return
         await session.commit()
@@ -313,6 +314,8 @@ async def execute_run(run_id: str, user_id: str, conversation_id: str, message: 
         if not run:
             return
         try:
+            await repo.append_event(run.id, "run_preparing", {})
+            await session.commit()
             initial = await _execution_initial(session, repo, run, user_id, conversation_id, message, request_id)
             await session.commit()
         except Exception as exc:
@@ -477,25 +480,44 @@ async def list_conversation_runs(conversation_id: str, user: CurrentUser, sessio
 
 
 @app.get("/api/v1/runs/{run_id}/events")
-async def run_events(run_id: str, user: CurrentUser, session: DBSession) -> StreamingResponse:
+async def run_events(run_id: str, request: Request, user: CurrentUser, session: DBSession,
+                     after: int = Query(default=0, ge=0)) -> StreamingResponse:
     run = await session.get(AgentRun, run_id)
     if not run or run.user_id != user.id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "run not found")
+    try:
+        resume = int(request.headers.get("last-event-id", "0"))
+    except ValueError:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "invalid Last-Event-ID")
+    cursor_start = max(after, resume)
+    if resume < 0 or cursor_start > run.event_sequence:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "invalid event cursor")
+    await session.rollback()
 
     async def event_stream() -> AsyncIterator[str]:
-        cursor = 0
+        cursor = cursor_start
+        heartbeat = asyncio.get_running_loop().time()
+        yield "retry: 1500\n\n"
         while True:
-            # Each polling operation uses its own DB session in real deployment; this compact
-            # starter emits the persisted trace and ends on a terminal run state.
-            events = await Repository(session).list_events(run_id, cursor)
-            for item in events:
-                cursor = item.sequence
-                yield f"event: {item.event_type}\ndata: {json.dumps({'sequence': item.sequence, 'payload': item.payload}, ensure_ascii=False, default=str)}\n\n"
-            await session.refresh(run)
-            if run.status in {"completed", "failed"}:
+            if await request.is_disconnected():
                 break
+            events = await Repository(session).list_events(run_id, cursor)
+            rows = [(item.sequence, item.event_type, item.payload) for item in events]
+            current = await session.execute(select(AgentRun.status, AgentRun.event_sequence).where(AgentRun.id == run_id))
+            current_status, sequence = current.one()
+            # Release the transaction/connection during network sends and idle waits.
+            await session.rollback()
+            for cursor, name, payload in rows:
+                yield f"id: {cursor}\nevent: {name}\ndata: {json.dumps({'sequence': cursor, 'payload': payload}, ensure_ascii=False, default=str)}\n\n"
+            if current_status in {"completed", "failed"} and cursor >= sequence:
+                break
+            now = asyncio.get_running_loop().time()
+            if now-heartbeat >= 10:
+                yield ": heartbeat\n\n"
+                heartbeat = now
             await asyncio.sleep(0.25)
-    return StreamingResponse(event_stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache"})
+    return StreamingResponse(event_stream(), media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 @app.get("/api/v1/runs/{run_id}")
@@ -504,17 +526,33 @@ async def get_run(run_id: str, user: CurrentUser, session: DBSession) -> dict:
     if not run or run.user_id != user.id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "run not found")
     state = run.graph_state or {}
+    from ..research.failures import run_failure_report
+    failure_report = run_failure_report(state)
+    if not state.get("completion") and run.status == "running":
+        persisted_report = await session.scalar(select(AgentEvent.payload).where(AgentEvent.run_id == run_id,
+            AgentEvent.event_type == "run_diagnostics").order_by(AgentEvent.sequence.desc()).limit(1))
+        if persisted_report:
+            failure_report = persisted_report
     routing = state.get("routing_diagnostics")
     if not routing:
         routing = await session.scalar(select(AgentEvent.payload).where(AgentEvent.run_id == run_id,
             AgentEvent.event_type == "router_diagnostics").order_by(AgentEvent.sequence.desc()).limit(1))
+    progress = await session.scalar(select(AgentEvent).where(AgentEvent.run_id == run_id,
+        AgentEvent.event_type.in_(["run_preparing", "run_started", "goal_parse_started", "goal_parsed", "routing_started",
+            "route_selected", "agent_started", "agent_completed", "research_progress", "completion_checked",
+            "repair_round_started", "synthesis_started"])).order_by(AgentEvent.sequence.desc()).limit(1))
+    latest_draft = await session.scalar(select(AgentEvent).where(AgentEvent.run_id == run_id,
+        AgentEvent.event_type.in_(["answer_snapshot", "answer_reset"])).order_by(AgentEvent.sequence.desc()).limit(1))
     return {"id": run.id, "status": run.status, "trace_id": run.trace_id, "answer": state.get("answer", ""),
             "routing_diagnostics": routing or {}, "route_decision": state.get("route_decision"),
             "approval_ids": state.get("approval_ids", []),
             "conflict_ids": state.get("conflict_ids", []),
             "completion": state.get("completion"), "profile_result": state.get("profile_result"),
             "research_result": state.get("research_result"), "plan_result": state.get("plan_result"),
-            "error": state.get("error")}
+            "error": state.get("error"), "failure_report": failure_report,
+            "created_at": run.created_at, "last_event_sequence": run.event_sequence,
+            "progress": {"event_type": progress.event_type, **progress.payload} if progress else {},
+            "draft_answer": latest_draft.payload.get("text", "") if latest_draft and latest_draft.event_type == "answer_snapshot" and run.status == "running" else ""}
 
 
 @app.get("/api/v1/memory/preferences")

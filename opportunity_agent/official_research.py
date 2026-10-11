@@ -505,11 +505,21 @@ def _safe_error_message(exc: Exception) -> str:
     return f"{type(exc).__name__}: {text}" if text else type(exc).__name__
 
 
+# Lookup is first-match: the longer "…computer science and engineering" must
+# precede "…computer science", which is its substring.
 _PROGRAM_IDENTITIES: dict[str, dict[str, tuple[str, ...]]] = {
+    "mscse": {"aliases": ("mscse", "ms in cse", "ms cse", "m.s. in computer science and engineering",
+                          "master of science in computer science and engineering", "cse ms"),
+              "departments": ("computer science and engineering", "cse", "computer science and engineering department")},
     "mscs": {"aliases": ("mscs", "m.s. in computer science", "master of science in computer science",
                              "masters in computer science", "computer science ms"),
                "departments": ("computer science", "computer science department", "school of computer science",
                                "computer science and engineering", "siebel school", "cs graduate")},
+    # Registered so a data-science page is recognised as a *different* programme
+    # instead of passing on a CS department name in its navigation.
+    "data science": {"aliases": ("master of data science", "m.s. in data science", "ms in data science",
+                                 "master of science in data science", "msds", "mds"),
+                     "departments": ("data science institute", "school of data science")},
     "computer science": {"aliases": ("computer science", "m.s. in computer science", "master of science in computer science"),
                           "departments": ("computer science department", "school of computer science", "siebel school", "cs graduate")},
     "artificial intelligence": {"aliases": ("artificial intelligence", "ai", "machine learning"),
@@ -573,6 +583,28 @@ def classify_program_page(program: str, title: str, url: str, text: str) -> tupl
     # identity signals than department names repeated in navigation/footer.
     identity_header = _normalise_entity(" ".join([title, url]))
     identity_zone = _normalise_entity(" ".join([title, url, text[:2000]]))
+    master_requested = bool(re.search(r"\b(?:master|masters|ms|mscs|mscse|mcs|msml|msaii)\b", program, re.I))
+    if (master_requested and re.search(r"\bph\.?d\b|doctoral|doctorate", identity_header)
+            and not re.search(r"\bmaster|\bms\b|\bm\.s\.", identity_header)):
+        return "rejected", "program", ["doctoral page cannot establish a master's programme"]
+    # An ambiguous acronym is a local discovery query, not a globally expanded
+    # degree name. Resolve it against the official page heading, never a footer.
+    acronym = re.fullmatch(r"(?:MS\s+)?([A-Za-z]{2,6})", program.strip(), re.I)
+    if acronym and (acronym[1].upper() == "CSE" or not program_identity(program)):
+        wanted = acronym[1].upper()
+        headings = [line for line in text[:2000].splitlines()[:20]
+                    if re.match(r"\s*(?:#+\s|School of |Department of |Master of |M\.S\.)", line)
+                    and len(line) <= 200]
+        for heading in [title, *headings]:
+            words = re.findall(r"[A-Za-z]+", heading)
+            for start in range(len(words)):
+                for end in range(start + 2, min(len(words), start + 9) + 1):
+                    phrase = words[start:end]
+                    significant = [w for w in phrase if w.lower() not in {"and", "of", "the", "in", "for"}]
+                    if (len(significant) >= 2 and "".join(w[0].upper() for w in significant) == wanted
+                            and phrase[0][0].isupper() and phrase[-1][0].isupper()):
+                        return "exact", "program", ["page-local acronym: " + " ".join(phrase)]
+        return "generic", "university_wide", ["acronym meaning not established by page heading"]
     identity = program_identity(program)
     if identity:
         program_text = _normalise_entity(program)

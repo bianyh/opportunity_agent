@@ -302,6 +302,7 @@ def test_multiple_intake_years_use_explicit_product_default(monkeypatch):
 def test_mcp_body_verification_and_field_specific_freshness(monkeypatch, only_gre, expected):
     from opportunity_agent.v2.research.service import WebExtraction, WebFact
     monkeypatch.setenv("RESEARCH_QUEUE_INGEST", "0")
+    monkeypatch.setenv("RESEARCH_KEYWORD_EXTRACTION", "0")  # tests the model's field coverage
     class Web:
         search_calls = page_calls = 0
         search_limit, page_limit = 2, 5
@@ -321,7 +322,8 @@ def test_mcp_body_verification_and_field_specific_freshness(monkeypatch, only_gr
             facts = [WebFact(field="gre_policy", value="optional", quote="GRE is optional.")]
             if not only_gre:
                 facts.append(WebFact(field="deadline", value="2026-12-10", quote="Application deadline: December 10, 2026."))
-            return WebExtraction(university="CMU", program="MSCS", intake="2027 Fall", facts=facts)
+            from research_response_fixtures import structured
+            return structured(kwargs['context'], facts)
     async def run():
         engine, factory = await seeded_session()
         async with factory() as session:

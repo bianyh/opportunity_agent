@@ -10,6 +10,7 @@ from ..agents.contracts import Evidence, ProgramResult, ResearchFact, merge_evid
 from ..db.models import OfficialSource, ResearchProgram, ResearchRequirement
 from .quality import program_matches
 from .identity import school_aliases, program_aliases, normalize_intake, intake_aliases
+from .temporal import CURRENT_POLICY_PREFIX
 
 
 class ResearchCatalog:
@@ -21,6 +22,10 @@ class ResearchCatalog:
 
     async def search(self, task, *, include_unknown=False):
         statement = select(ResearchProgram)
+        if task.entities.program_family == "computer_science":
+            statement = statement.where(or_(
+                func.lower(ResearchProgram.program).like("%computer science%"),
+                func.lower(ResearchProgram.program).in_(["mscs", "mcs", "cse", "ms cse"])))
         if task.entities.targets:
             statement = statement.where(or_(*(and_(
                 func.lower(ResearchProgram.university).in_([a.casefold() for a in school_aliases(t.university)]),
@@ -54,7 +59,7 @@ class ResearchCatalog:
                         predicate.append(rr.date_value <= c.deadline_before)
                 elif field == "gre_policy" and c.gre_policy != "any":
                     allowed = ["required"] if c.gre_policy == "required" else ["optional", "not_required", "not_accepted"]
-                    predicate.append(rr.qualifier.in_(allowed))
+                    predicate.append(rr.qualifier.in_(allowed + [CURRENT_POLICY_PREFIX + value for value in allowed]))
                 else:
                     continue
                 statement = statement.where(select(rr.id).where(*predicate).exists())
@@ -79,20 +84,30 @@ class ResearchCatalog:
             verified = observation.status == "verified" and source.status == "verified" and observation.program_match == "exact"
             expired = observation.expires_at and observation.expires_at.date() < today
             status = "stale" if expired else "verified" if verified else "unknown"
+            current_policy = observation.qualifier.startswith(CURRENT_POLICY_PREFIX)
+            proof = observation.extraction_provenance or {}
             evidence = Evidence(source_id=source.id, url=source.url, title=source.title,
-                excerpt=observation.excerpt, content_hash=observation.content_hash, intake=row.intake,
+                excerpt=observation.excerpt, content_hash=observation.content_hash, intake="" if current_policy else row.intake,
+                temporal_scope="current_policy" if current_policy else "explicit_intake" if proof else "legacy",
+                extraction_provenance=proof,
                 authority="official" if source.status == "verified" else "rejected",
                 program_match=observation.program_match if observation.program_match in {"exact", "unknown", "rejected"} else "unknown",
                 retrieved_at=observation.verified_at.date(),
                 expires_at=observation.expires_at.date() if observation.expires_at else None,
                 supports_fields=[observation.field], relevance_method="sql_exact", relevance_passed=bool(verified and not expired))
             result.evidence.append(evidence)
-            fact = ResearchFact(field=observation.field, value=observation.value, qualifier=observation.qualifier,
+            fact = ResearchFact(field=observation.field, value=observation.value,
+                qualifier=observation.qualifier.removeprefix(CURRENT_POLICY_PREFIX),
                 verification_status=status, evidence_ids=[evidence.evidence_id])
             grouped.setdefault(observation.field, []).append(fact)
         for field, facts in grouped.items():
             valid = [f for f in facts if f.verification_status == "verified"]
-            if len({json.dumps(f.value, sort_keys=True) for f in valid}) > 1:
+            from .extraction import program_key
+            identities = {program_key(e.extraction_provenance['fact']['program']) for e in result.evidence
+                          if e.extraction_provenance.get('fact')}
+            units = {e.extraction_provenance.get("fact", {}).get("home_unit", "").casefold()
+                     for e in result.evidence if e.extraction_provenance.get("fact", {}).get("home_unit")}
+            if len({json.dumps(f.value, sort_keys=True) for f in valid}) > 1 or len(units) > 1 or len(identities) > 1:
                 for f in valid:
                     f.verification_status = "conflicting"
             elif valid:
