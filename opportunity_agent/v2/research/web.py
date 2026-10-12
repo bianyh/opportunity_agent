@@ -472,11 +472,18 @@ class OfficialWeb:
         if cache_key in self._sitemap_cache:
             return self._sitemap_cache[cache_key]
         probes = []
-        for root in self._candidate_roots(domains, query):
+        from .program_directory import navigation_entries
+        programme_roots = list(dict.fromkeys(
+            f"https://{urlparse(url).netloc}" for entry in navigation_entries(query)
+            for url in entry["urls"] if self._allowed(url, domains)))
+        # A known programme site is a stronger starting point than guessing
+        # graduate-school subdomains across the whole university.
+        for root in (programme_roots or self._candidate_roots(domains, query)):
             domain = next((item for item in domains if urlparse(root).hostname == item
                            or urlparse(root).hostname.endswith("." + item)), domains[0])
-            probes.extend([(domain, "robots", root + "/robots.txt"),
-                           (domain, "sitemap", root + "/sitemap.xml")])
+            probes.append((domain, "robots", root + "/robots.txt"))
+            if not programme_roots:
+                probes.append((domain, "sitemap", root + "/sitemap.xml"))
             if urlparse(root).hostname not in {domain, "www." + domain}:
                 probes.append((domain, "home", root + "/"))
         fetched_probes = await asyncio.gather(*(
@@ -500,6 +507,13 @@ class OfficialWeb:
                     candidate = urljoin(fetched[0], html.unescape(href))
                     if self._allowed(candidate, domains) and self._robots_allowed(candidate):
                         linked_pages.append(candidate)
+        if programme_roots:
+            # The directory already identifies the programme's application
+            # page. Home-page links supply genuine alternatives if it moves;
+            # university-wide sitemap crawling only delays the first read.
+            result = list(dict.fromkeys(url for url in linked_pages if self._robots_allowed(url)))
+            self._sitemap_cache[cache_key] = result
+            return result
         if not sitemap_urls:
             sitemap_urls.extend(f"https://{domain}{path}" for domain in domains
                                 for path in ("/sitemap_index.xml", "/sitemap-index.xml"))
@@ -638,15 +652,16 @@ class OfficialWeb:
             scored.append((score, len(text), url))
         scored.sort(key=lambda item: (-item[0], item[1], item[2]))
         # Department aliases commonly redirect to the same canonical page.
-        # Keep one URL per path so the bounded reader spends its page budget
-        # on different official pages, especially a central admissions page
-        # that may carry the requested intake year.
+        # Same paths on different department sites are NOT the same page.
+        # Only collapse the common www/non-www alias of the same host.
         result, seen_paths = [], set()
         for _, _, url in scored:
-            path = (urlparse(url).path or "/").rstrip("/").casefold() or "/"
-            if path in seen_paths:
+            parsed = urlparse(url)
+            key = (parsed.netloc.casefold().removeprefix("www."),
+                   (parsed.path or "/").rstrip("/").casefold() or "/", parsed.query)
+            if key in seen_paths:
                 continue
-            seen_paths.add(path)
+            seen_paths.add(key)
             result.append(url)
         return result
 
@@ -697,9 +712,14 @@ class OfficialWeb:
         domains = tuple(str(d).casefold().rstrip(".") for d in domains)
         if not domains:
             return {"results": [], "diagnostic": "no_registered_domain"}
+        from .program_directory import navigation_entries
+        entries = list(navigation_entries(query))
+        seeds = [url for entry in entries for url in entry["urls"] if self._allowed(url, domains)]
+        query = " ".join([query, *(entry["abbreviation"] for entry in entries)])
         sitemap_pages = await self._sitemap_urls(domains, query)
         search_pages = await self._search_engine(query, domains)
-        urls = [item[0] for item in search_pages] + sitemap_pages
+        discovered = [item[0] for item in search_pages] + sitemap_pages
+        urls = []
         paths = list(self._DEFAULT_PATHS) + [
             "/education/graduate-admissions",
             "/education/graduate-studies/admissions",
@@ -714,12 +734,15 @@ class OfficialWeb:
             paths.extend(["/academics/masters-programs/msaii.html"])
         for root in self._candidate_roots(domains, query):
             urls.extend(urljoin(root + "/", path.lstrip("/")) for path in paths)
-        ranked = self._rank(urls, query)
-        ranked = [url for url in ranked if self._robots_allowed(url)]
+        # Source-linked URLs and verified navigation seeds take precedence over
+        # speculative paths. A guessed 404 must not evict a real project page.
+        ranked = list(dict.fromkeys([*seeds, *self._rank(discovered, query), *self._rank(urls, query)]))
+        ranked = [url for url in ranked if self._allowed(url, domains) and self._robots_allowed(url)]
         title_by_url = {url: title for url, title in search_pages}
         return {"results": [{"url": url, "title": title_by_url.get(url, ""), "content": "official URL candidate"}
                              for url in ranked[:max(5, min(12, self.page_limit * 2))]],
-                "diagnostic": {"sitemap_candidates": len(sitemap_pages), "search_candidates": len(search_pages)}}
+                "diagnostic": {"sitemap_candidates": len(sitemap_pages), "search_candidates": len(search_pages),
+                               "directory_candidates": len(seeds)}}
 
     async def validate_url(self, url, domains):
         from .repair import ToolFailure

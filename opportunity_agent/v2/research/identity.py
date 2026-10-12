@@ -54,8 +54,9 @@ def normalize_intake(value):
     year = re.search(r"20\d{2}", value)
     if not year:
         return value.strip()
-    for season, pattern in (("Fall", r"\bfall\b|\bautumn\b|秋季"),
-                            ("Spring", r"\bspring\b|春季"), ("Summer", r"\bsummer\b|夏季")):
+    for season, pattern in (("Fall", r"(?<![a-z])(?:fall|autumn)(?![a-z])|秋季"),
+                            ("Spring", r"(?<![a-z])spring(?![a-z])|春季"),
+                            ("Summer", r"(?<![a-z])summer(?![a-z])|夏季")):
         if re.search(pattern, value, re.I):
             return year[0] + " " + season
     return year[0]

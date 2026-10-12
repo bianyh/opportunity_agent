@@ -84,7 +84,7 @@ def test_real_semantic_intent_still_uses_hybrid():
     ("CMU MSAII 最新截止日期", "2027", True),
     ("CMU MSAII 春季截止日期", "2027 Spring", True),
     ("CMU MSAII 2028 年截止日期", "2028", False),
-    ("CMU MSAII 2028 Fall deadline", "2028 fall", False),
+    ("CMU MSAII 2028 Fall deadline", "2028 Fall", False),
     ("deadline after 2026-12-01", "2027", True),
 ])
 def test_default_intake_policy(query, intake, defaulted):

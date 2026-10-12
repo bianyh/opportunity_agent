@@ -31,7 +31,7 @@ from .result_aggregation import ResultAggregator
 from .profile_extraction import ProfileExtractionPipeline, is_contextual_profile_answer
 from ..services.memory import explicit_preferences
 from ..services.memory_contracts import ConsolidationInput
-from ..research.task import is_policy_impact_question, parse_task
+from ..research.task import is_policy_impact_question, is_gre_policy_question, parse_task
 from .contracts import (
     AgentName,
     CompletionResult,
@@ -182,6 +182,8 @@ counts and must not create research criteria."""
             if self.allow_heuristic_fallback:
                 return await self.fallback.parse(message)
             raise GoalParserUnavailable(f"LLM Goal Parser failed: {type(exc).__name__}: {exc}") from exc
+        if is_gre_policy_question(message):
+            criteria.gre_policy = "any"
         # An empty object is the model's representation of no executable goal.
         return criteria if _has_success_constraint(criteria) else None
 
@@ -220,7 +222,7 @@ def _extract_program_count(message: str) -> int | None:
 
 
 def _extract_gre_policy(message: str) -> str:
-    if is_policy_impact_question(message):
+    if is_policy_impact_question(message) or is_gre_policy_question(message):
         return "any"  # Compare policies; do not hide GRE-required programmes.
     if re.search(r"(?:不考虑|不接受|排除).{0,10}(?:需要|要求)?\s*GRE", message, re.I):
         return "not_required"
@@ -582,7 +584,10 @@ class DeterministicSynthesizer:
                     if links:
                         notice = "（当前官网信息；适用入学季未确认）" if any(
                             sources[eid].temporal_scope == "current_policy" for eid in fact.evidence_ids if eid in sources) else ""
-                        rows.append(f"- {labels.get(fact.field, fact.field)}：{fact.value}{notice} {' '.join(links)}")
+                        value = {"required": "必须提交 GRE 成绩", "optional": "GRE 可选提交",
+                                 "not_required": "不要求提交 GRE 成绩", "not_accepted": "不接受 GRE 成绩"}.get(
+                                     str(fact.value), fact.value) if fact.field == "gre_policy" else fact.value
+                        rows.append(f"- {labels.get(fact.field, fact.field)}：{value}{notice} {' '.join(links)}")
                 if rows:
                     sections.append(f"**{program.university} — {program.program}（{program.intake}）**\n\n" + "\n".join(dict.fromkeys(rows)))
             sources = {e.evidence_id: e for e in [*research.evidence, *(e for p in research.programs for e in p.evidence)]}
@@ -665,6 +670,9 @@ class LLMSynthesizer:
 Write a useful, natural Markdown response in the user's language. You do not route,
 search, call tools, write profile data, write memory, or make any decision outside
 the supplied context.
+Lead with the requested answers. For a narrow factual lookup, do not add unrelated
+application materials, language tests, rankings or advice just because they occur
+in the same source page. Do not transfer a condition from another test/section to GRE.
 
 Use only facts in the supplied context. Never invent a school requirement, date,
 GRE policy, citation, or user preference. If research evidence is absent or a field
@@ -894,6 +902,10 @@ class CustomOrchestrator:
     @staticmethod
     def _add_intake_notice(state):
         task = state.research_result.diagnostics.get("task", {}) if state.research_result else {}
+        corrections = task.get("routing", {}).get("entity_corrections", [])
+        if corrections:
+            notice = "；".join(f"将你输入的 {c['input']} 按 {c['university']} 的 {c['resolved']} 项目查询" for c in corrections)
+            state.answer = notice + "。\n\n" + state.answer
         if task.get("intake_defaulted"):
             notice = "本次未指定入学年份，按默认 2027 年查询；未指定学期时不默认秋季。"
             state.answer = notice + "\n\n" + state.answer

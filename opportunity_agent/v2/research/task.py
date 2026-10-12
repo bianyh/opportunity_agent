@@ -8,7 +8,8 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from ..agents.contracts import SuccessCriteria
-from .identity import school_aliases, canonical_school, program_aliases
+from .identity import school_aliases, canonical_school, program_aliases, normalize_intake
+from .program_directory import registered_program, visual_program_mentions
 from ...official_research import OfficialDomainRegistry
 
 
@@ -73,6 +74,15 @@ def is_policy_impact_question(query):
                 and not re.search(r"帮我找|推荐|筛选|列出|find|recommend|filter", query, re.I))
 
 
+def is_gre_policy_question(query):
+    """Asking what a policy is is not a preference to filter programmes by it."""
+    if re.search(r"找|推荐|筛选|列出|\b(?:find|recommend|filter|list)\b", query, re.I):
+        return False
+    return bool(re.search(
+        r"GRE\s*(?:要求|政策|是否|需要吗|必须吗)|(?:是否|要不要|需不需要|需要不需要).{0,10}GRE"
+        r"|\b(?:is|are|does|do)\b.{0,30}\bGRE\b|\bGRE\s+(?:requirements?|policy)\b", query, re.I))
+
+
 def parse_task(request, catalogue=(), llm=None) -> ResearchTaskSpec:
     query = request.message
     lower = query.casefold()
@@ -128,6 +138,16 @@ def parse_task(request, catalogue=(), llm=None) -> ResearchTaskSpec:
             if mentioned(alias):
                 programs = {p for p in programs if p.casefold() != alias.casefold()}
                 programs.add(row.program)
+    corrections = []
+    if len(schools) == 1:
+        school = next(iter(schools))
+        corrections = visual_program_mentions(query, school)
+        programs.update(item["resolved"] for item in corrections)
+        # A school-local official full name gives the source verifier a real
+        # identity, not a global acronym expansion asserted to be page evidence.
+        programs = {entry["program"] if (entry := registered_program(school, p)) else p for p in programs}
+    if corrections:
+        task.routing_diagnostics["entity_corrections"] = corrections
     if len(schools) == 1:
         task.entities.university = next(iter(schools))
     if len(programs) == 1:
@@ -146,14 +166,15 @@ def parse_task(request, catalogue=(), llm=None) -> ResearchTaskSpec:
             re.search(r"(?<![a-z0-9])" + re.escape(a.casefold()) + r"(?![a-z0-9])", clause_lower)
             if a.isascii() else a.casefold() in clause_lower for a in school_aliases(s))]
         local_programs = [p for p in programs if any(re.search(
-            r"(?<![a-z0-9])" + re.escape(a.casefold()) + r"(?![a-z0-9])", clause_lower) for a in program_aliases(p))]
+            r"(?<![a-z0-9])" + re.escape(a.casefold()) + r"(?![a-z0-9])", clause_lower)
+            for a in (*program_aliases(p), *(c["input"] for c in corrections if c["resolved"] in program_aliases(p))))]
         if len(local_schools) == 1 and len(local_programs) == 1:
             paired.append(ResearchTarget(university=local_schools[0], program=local_programs[0]))
     if schools and {p.university for p in paired} == schools:
         task.entities.targets = list({(p.university, p.program): p for p in paired}.values())
-    year = re.search(r"(20\d{2})\s*(fall|spring|autumn|summer)|(?:秋季|春季)(20\d{2})|(?:入学|intake)\s*(20\d{2})|(20\d{2})年?(?:秋季|春季|入学)", lower)
+    year = re.search(r"(20\d{2})\s*(fall|spring|autumn|summer)|(?:fall|spring|autumn|summer)\s*(20\d{2})|(?:秋季|春季|夏季)(20\d{2})|(?:入学|intake)\s*(20\d{2})|(20\d{2})年?(?:秋季|春季|夏季|入学)", lower)
     if year:
-        task.entities.intake = year.group(0).strip()
+        task.entities.intake = normalize_intake(year.group(0))
         # Prefer the exact catalogue spelling when the season/year identify it.
         target_year = next(g for g in year.groups() if g and re.fullmatch(r"20\d{2}", g))
         matches = {r.intake for r in catalogue if target_year in r.intake and intake_supported(r.intake, query)

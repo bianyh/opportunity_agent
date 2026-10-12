@@ -180,11 +180,21 @@ def candidate_blocks(page, target, fields, limit=10000):
                            or program_key(target.program) in program_key(heading)) else 'other'
     if any(local_identity(b) == 'match' for b in candidates):
         candidates = [b for b in candidates if local_identity(b) != 'other']
+    anchors = {'deadline': r'deadline|closing date|closes|截止',
+               'gre_policy': r'(?<![a-z])gre(?![a-z])|graduate record',
+               'tuition': r'tuition|学费', 'language': r'toefl|ielts|duolingo|english proficiency|语言'}
+    # With explicit passages for every field, generic application prose is
+    # not a reason to send the entire requirements page to the model.
+    anchor_fields = {f for f in fields if any(re.search(anchors.get(f, r'(?!)'), b['text'], re.I)
+                                            for b in candidates)}
     def score(b):
         # Programme names alone must not pull news/marketing into the prompt.
         s = b['text'].casefold()
         leaf = b['headings'][-1].casefold() if b['headings'] else ''
-        return sum(term in s or term in leaf for term in terms)
+        strong = sum(bool(re.search(anchors[f], s + ' ' + leaf, re.I)) for f in anchor_fields)
+        if anchor_fields == set(fields) and not strong:
+            return 0
+        return strong * 10 + sum(term in s or term in leaf for term in terms)
     selected, size = [], 0
     for block in sorted(candidates, key=lambda b: (-score(b), b['start'])):
         if not score(block):
@@ -205,6 +215,30 @@ def official_source(university, url):
                     and parsed.port in {None, 443} and any(host == d or host.endswith('.' + d) for d in record['domains']))
     except ValueError:
         return False
+
+
+def bind_local_intake(parsed, target, source_blocks):
+    """Attach a unique explicitly stated cycle from the fact's OWN block.
+
+    This fills source metadata only, never a date/policy value. A requested year,
+    another block, multiple cycles or a conflicting cycle cannot supply it.
+    The unchanged verifier still validates identity, scope and every claim.
+    """
+    lookup = {b['id']: b for b in source_blocks}
+    facts = []
+    for fact in parsed.facts:
+        block = lookup.get(fact.block_id)
+        if fact.intake or not block:
+            facts.append(fact)
+            continue
+        local = '\n'.join([*block['headings'], block['text']])
+        matches = list(re.finditer(
+            r'(?<!\w)(?:(?:fall|autumn|spring|summer)\s*20\d{2}|20\d{2}\s*(?:fall|autumn|spring|summer))(?!\w)', local, re.I))
+        cycles = {normalize_intake(m[0]) for m in matches}
+        if len(cycles) == 1 and intake_matches(target.intake, next(iter(cycles))):
+            fact = fact.model_copy(update={'intake': next(iter(cycles)), 'intake_quote': matches[0][0]})
+        facts.append(fact)
+    return parsed.model_copy(update={'facts': facts})
 
 
 def normalized_date(raw):

@@ -277,11 +277,19 @@ class ResearchService:
             "research": {"research", "lab", "laboratory", "faculty", "研究", "实验室", "导师", "方向"},
         }
         parsed_quotes = [fact.quote for fact in parsed.facts if fact.quote]
+        anchors = {
+            "deadline": r"deadline|closing date|applications? (?:are |is )?due|截止",
+            "gre_policy": r"(?<![a-z])gre(?![a-z])|graduate record examination",
+        }
+        anchored = {topic for topic in topics if topic in anchors and any(
+            re.search(anchors[topic], block, re.I) for block in blocks)}
         scored = []
         for index, block in enumerate(blocks):
             folded = block.casefold()
             score, supports = 0.0, []
             for topic in topics:
+                if topic in anchored and not re.search(anchors[topic], block, re.I):
+                    continue
                 terms = field_terms.get(topic, cls._passage_terms(topic))
                 hits = [term for term in terms if term.casefold() in folded]
                 if hits:
@@ -524,7 +532,10 @@ class ResearchService:
                                         page = await web.read(url, domains)
                                         read_span.set_attribute("read.method", page.get("read_method", "direct"))
                                     stage = "extract"
-                                    self._page_deadline = started + school_remaining
+                                    # The inner model timeout must fire BEFORE
+                                    # the outer page deadline, leaving time to
+                                    # retain exact passages and persist results.
+                                    self._page_deadline = web.request_deadline - 5
                                     with span("research.page.extract", target_id=target_key, page_id=page_key):
                                         await self._progress("extract", school=target.university, program=target.program,
                                                              current=index+1, total=len(targets))
@@ -533,6 +544,8 @@ class ResearchService:
                                             if extraction_failures >= failure_limit else "",
                                             allow_extraction_fallback=True, allow_blocked_fallback=True)
                                 entry["pages"][page_key] = {"status": "processed"}
+                                if not self._missing(task, result):
+                                    break  # Requested fields already supported.
                             except Exception as exc:
                                 detail = safe_error_details(exc)
                                 entry["pages"][page_key] = {"status": "failed", "stage": stage, **detail}
@@ -580,6 +593,12 @@ class ResearchService:
             canonical_school(u) == canonical_school(p.university) and canonical_program(name) == canonical_program(p.program)
             and intake_matches(p.intake, intake) for u, name, intake in task.excluded_programs)}
         for target in unique.values():
+            from .program_directory import registered_program
+            entry = registered_program(target.university, target.program)
+            if entry:
+                # Catalogue aliases are storage keys, not source evidence.
+                # Verify against the school's official full programme name.
+                target.program = entry["program"]
             if task.entities.degree:
                 target.degree = task.entities.degree
             if task.entities.home_unit:
@@ -614,6 +633,11 @@ class ResearchService:
             return None, False
         if not target.program:
             return None, False
+        passages = self._relevant_passages(task, page, parsed)
+        structured_only = bool(task.requested_fields) and not task.semantic_questions and set(
+            task.requested_fields) <= {"deadline", "gre_policy", "tuition", "language"}
+        if not passages and structured_only:
+            return program, False  # Marketing/contact copy does not answer a policy question.
         if program is None and attach_program:
             program = next((p for p in result.programs
                 if canonical_school(p.university) == canonical_school(target.university)
@@ -630,7 +654,6 @@ class ResearchService:
             self._require_fields(task, program)
         digest = hashlib.sha256(page["text"].encode()).hexdigest()
         source_id = hashlib.sha256(page["url"].encode()).hexdigest()[:32]
-        passages = self._relevant_passages(task, page, parsed)
         if not passages:
             lines = [re.sub(r"\s+", " ", line).strip() for line in page["text"].splitlines()]
             passages = [(line[:1200], ["source_text"]) for line in lines if len(line) >= 35][:2]
@@ -864,7 +887,7 @@ class ResearchService:
                     result.diagnostics.setdefault('ingest_queue_errors', []).append({'code': type(exc).__name__})
 
     async def _extract_with_model(self, task, result, target, page, fields, profile):
-        from .extraction import AdmissionExtraction, SYSTEM, candidate_blocks, CACHE, verify_fact
+        from .extraction import AdmissionExtraction, SYSTEM, candidate_blocks, bind_local_intake, CACHE, verify_fact
         remaining = min(getattr(self, "_deadline", float("inf")),
                         getattr(self, "_page_deadline", float("inf"))) - asyncio.get_running_loop().time()
         timeout_budget = seconds("RESEARCH_COMPACT_EXTRACT_TIMEOUT_SECONDS", 20, 120) if profile == "compact" \
@@ -906,6 +929,7 @@ class ResearchService:
                         system=SYSTEM, context=context, temperature=0, max_tokens=3000, thinking=False,
                         deadline=time.monotonic()+budget, diagnostics=diagnostics, allow_format_fallback=False)
             parsed = AdmissionExtraction.model_validate(parsed.model_dump())
+            parsed = bind_local_intake(parsed, target, selected)
             # Only cache grounded successes. Empty/error/rejected results must be repairable.
             if use_cache and parsed.facts and all(verify_fact(f, target, page, fields, task.as_of)[0] for f in parsed.facts):
                 CACHE.put(key, parsed)

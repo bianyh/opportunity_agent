@@ -76,6 +76,10 @@ class ResearchCatalog:
     async def result(self, row, as_of=None):
         today = as_of or date.today()
         result = ProgramResult(program_id=row.id, university=row.university, program=row.program, intake=row.intake, country=row.country)
+        from .program_directory import registered_program
+        entry = registered_program(row.university, row.program)
+        if entry:
+            result.program = entry["program"]
         pairs = (await self.session.execute(select(ResearchRequirement, OfficialSource)
             .join(OfficialSource, ResearchRequirement.source_id == OfficialSource.id)
             .where(ResearchRequirement.program_id == row.id).order_by(ResearchRequirement.id))).all()
