@@ -5,6 +5,21 @@
     profile:$('profile-view'), plan:$('plan-view'), approvals:$('approvals-view'), steps:$('run-steps')};
   const state = {user:null, conversations:[], conversationId:null, profile:null, plan:null,
     plans:[], approvals:[], preferences:[], conflicts:[], activeTab:'profile', running:false, authMode:'login'};
+  let requestSequence = 0;
+  function requestId() {
+    const webCrypto = globalThis.crypto;
+    if (typeof webCrypto?.randomUUID === 'function') return webCrypto.randomUUID();
+    // HTTP on a LAN address lacks randomUUID, but still permits getRandomValues.
+    if (typeof webCrypto?.getRandomValues === 'function') {
+      const bytes = webCrypto.getRandomValues(new Uint8Array(16));
+      bytes[6] = (bytes[6] & 0x0f) | 0x40;
+      bytes[8] = (bytes[8] & 0x3f) | 0x80;
+      const hex = Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('');
+      return `${hex.slice(0,8)}-${hex.slice(8,12)}-${hex.slice(12,16)}-${hex.slice(16,20)}-${hex.slice(20)}`;
+    }
+    // These IDs deduplicate requests; they are not authentication credentials.
+    return `request-${Date.now().toString(36)}-${(++requestSequence).toString(36)}-${Math.random().toString(36).slice(2)}`;
+  }
   const fields = [
     ['school','本科学校'],['major','专业'],['academic_year','年级','number'],
     ['graduation_year','毕业年份','number'],['target_degree','目标学位'],
@@ -190,7 +205,7 @@
     const conversationId=state.conversationId;
     try {
       const run=await request('/conversations/'+encodeURIComponent(conversationId)+'/runs',{
-        method:'POST',body:JSON.stringify({message,request_id:crypto.randomUUID()})});
+        method:'POST',body:JSON.stringify({message,request_id:requestId()})});
       if(state.conversationId!==conversationId){finishRun();return;}
       showRunInfo(run.run_id);
       await followRun(run.run_id,message,conversationId);
@@ -326,7 +341,7 @@
       payload[key]=!raw?null:type==='list'?raw.split(/[,，、;；]/).map(x=>x.trim()).filter(Boolean):type==='number'?Number(raw):raw;}
     for(const [key,,type] of fields) if(type==='list') payload[key] ||= [];
     payload.onboarding_completed=true;
-    try {const result=await request('/profile',{method:'PATCH',body:JSON.stringify({payload,expected_version:state.profile.version,request_id:crypto.randomUUID()})});
+    try {const result=await request('/profile',{method:'PATCH',body:JSON.stringify({payload,expected_version:state.profile.version,request_id:requestId()})});
       $('profile-dialog').close(); toast(result.status==='no_change'?'画像没有变化':'画像变更已提交，请确认后生效');
       if(result.approval_id){await loadApprovals();switchTab('approvals');}}
     catch(error){toast(error.message); if(error.message.includes('changed')) await loadProfile();}
@@ -355,7 +370,7 @@
     let evidence=''; let due_at=null;
     if(action==='postpone'){const date=prompt('新的日期（YYYY-MM-DD）');if(!date)return;if(!/^\d{4}-\d{2}-\d{2}$/.test(date)){toast('请输入完整日期');return;}due_at=date+'T00:00:00';}
     if(action==='complete') evidence=prompt('完成依据（可选）')||'';
-    try {const result=await request('/tasks/'+encodeURIComponent(id)+'/commands',{method:'POST',body:JSON.stringify({action,evidence,due_at,request_id:crypto.randomUUID()})});
+    try {const result=await request('/tasks/'+encodeURIComponent(id)+'/commands',{method:'POST',body:JSON.stringify({action,evidence,due_at,request_id:requestId()})});
       toast('已生成待确认任务变更'); await loadApprovals(); switchTab('approvals'); return result;}
     catch(error){toast(error.message);}
   }
@@ -398,7 +413,7 @@
   $('memory-view').onclick=async event=>{
     const button=event.target.closest('[data-revoke-preference]');if(!button)return;
     button.disabled=true;
-    try{await request('/memory/preferences/'+encodeURIComponent(button.dataset.revokePreference)+'/revoke',{method:'POST',body:JSON.stringify({request_id:crypto.randomUUID(),expected_version:Number(button.dataset.version)})});toast('偏好已撤销');}
+    try{await request('/memory/preferences/'+encodeURIComponent(button.dataset.revokePreference)+'/revoke',{method:'POST',body:JSON.stringify({request_id:requestId(),expected_version:Number(button.dataset.version)})});toast('偏好已撤销');}
     catch(error){toast(error.message);}
     finally{await loadMemory().catch(error=>toast(error.message));}
   };

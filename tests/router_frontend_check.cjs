@@ -33,10 +33,22 @@ const sandbox = {document,EventSource,console,URL,encodeURIComponent,
   }
 };
 const source=fs.readFileSync(path.join(__dirname,'../opportunity_agent/v2/web/app.js'),'utf8')
-  .replace('  loadInitial();','  globalThis.routerTest={followRun,state,ui};');
+  .replace('  loadInitial();','  globalThis.routerTest={followRun,state,ui,requestId};');
 vm.createContext(sandbox);vm.runInContext(source,sandbox);
 async function check(){
-  const {followRun,state,ui}=sandbox.routerTest;
+  const {followRun,state,ui,requestId}=sandbox.routerTest;
+  // Insecure HTTP contexts expose getRandomValues without randomUUID.
+  const webCrypto=require('crypto').webcrypto;
+  sandbox.crypto={getRandomValues:webCrypto.getRandomValues.bind(webCrypto)};
+  const httpIds=Array.from({length:500},()=>requestId());
+  assert.equal(new Set(httpIds).size,httpIds.length);
+  assert.ok(httpIds.every(id=>/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(id)));
+  sandbox.crypto={randomUUID:()=> 'native-uuid'};
+  assert.equal(requestId(),'native-uuid');
+  delete sandbox.crypto;
+  const legacyIds=Array.from({length:500},()=>requestId());
+  assert.equal(new Set(legacyIds).size,legacyIds.length);
+  assert.ok(legacyIds.every(id=>id.length>0&&id.length<=128));
   state.conversationId='c';state.running=true;
   let followed=followRun('r1','CMU MSCS','c');
   streams[0].handlers.trace_started({data:JSON.stringify({payload:{trace_id:'a'.repeat(32)}})});
