@@ -90,7 +90,10 @@ class OfficialIngestionService:
             revision = getattr(self.embedder, "revision", None)
             if chunks and any(c.embedding is None or c.metadata_json.get("embedding_model") != self.embedder.model_name
                     or revision and c.metadata_json.get("embedding_revision") != revision for c in chunks):
-                vectors = await asyncio.to_thread(self.embedder.passages, [c.content for c in chunks])
+                try:
+                    vectors = await asyncio.to_thread(self.embedder.passages, [c.content for c in chunks])
+                except Exception:
+                    vectors = [None] * len(chunks)
                 for chunk, vector in zip(chunks, vectors, strict=True):
                     chunk.embedding = vector
             for chunk in chunks:
@@ -122,7 +125,13 @@ class OfficialIngestionService:
                 pieces.append(part)
                 paths.append(heading)
         if embeddings is None:
-            embeddings = await asyncio.to_thread(self.embedder.passages, pieces)
+            # Lexical retrieval is a valid fallback.  An unavailable local
+            # embedding model must not discard a freshly verified official
+            # page or make the user wait for a model download.
+            try:
+                embeddings = await asyncio.to_thread(self.embedder.passages, pieces)
+            except Exception:
+                embeddings = [None] * len(pieces)
         if len(embeddings) != len(pieces):
             raise ValueError("One embedding entry is required per chunk")
         for index, part in enumerate(pieces):

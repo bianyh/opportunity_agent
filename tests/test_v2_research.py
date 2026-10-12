@@ -335,6 +335,26 @@ def test_mcp_body_verification_and_field_specific_freshness(monkeypatch, only_gr
     asyncio.run(run())
 
 
+def test_official_page_becomes_citable_finding_without_llm(monkeypatch):
+    monkeypatch.setenv("RESEARCH_PERSIST_FACTS", "0")
+    page = {"url": "https://msaii.cs.cmu.edu/apply-msaii-program", "title": "Apply to the MSAII Program",
+            "text": "MSAII Master of Science in Artificial Intelligence and Innovation. "
+                    "Entry in Fall 2027. The deadline to apply is December 9, 2026. GRE is optional."}
+
+    async def run():
+        task = parse_task(request("CMU MSAII 2027 Fall 截止日期和 GRE 政策"))
+        result = ResearchResult()
+        service = ResearchService(None, llm=SimpleNamespace(enabled=False))
+        await service._accept_page(task, result,
+            ProgramResult(university="CMU", program="MSAII", intake="2027 Fall"), page)
+        assert len(result.programs) == 1
+        assert result.findings and "The deadline to apply is December 9, 2026." in result.findings[0].statement
+        assert result.programs[0].evidence[0].relevance_method == "official_page"
+        assert result.programs[0].evidence[0].relevance_passed is True
+
+    asyncio.run(run())
+
+
 def test_mcp_error_returns_existing_sql_results_and_path_history(monkeypatch):
     monkeypatch.setenv("RESEARCH_WEB_ENABLED", "1")
     class Web:

@@ -51,7 +51,8 @@ class BoundedWebRunner:
             self.result.diagnostics["web_target_count"] = len(targets)
             if not targets or self.ledger.state.get("blocked"):
                 return
-            transport = self.service.web_factory(search_limit=60, page_limit=60) if getattr(self.service.web_factory, "__name__", "") == "TavilyMCP" else self.service.web_factory()
+            transport = self.service.web_factory(search_limit=60, page_limit=60) if getattr(
+                self.service.web_factory, "__name__", "") in {"TavilyMCP", "OfficialWeb"} else self.service.web_factory()
             async with transport as self.web:
                 if not targets[0].university:
                     targets = await self.discover(targets[0])

@@ -43,6 +43,7 @@ from .contracts import (
     ResearchResult,
     RouteDecision,
     SuccessCriteria,
+    merge_evidence,
     research_revision,
 )
 
@@ -585,8 +586,13 @@ class DeterministicSynthesizer:
                 if rows:
                     sections.append(f"**{program.university} — {program.program}（{program.intake}）**\n\n" + "\n".join(dict.fromkeys(rows)))
             sources = {e.evidence_id: e for e in [*research.evidence, *(e for p in research.programs for e in p.evidence)]}
+            rendered_findings = set()
             for finding in research.findings:
                 if finding.evidence_ids and all(eid in sources and usable(sources[eid], criteria) for eid in finding.evidence_ids):
+                    finding_key = (finding.statement.strip(), tuple(sorted(finding.evidence_ids)))
+                    if finding_key in rendered_findings:
+                        continue
+                    rendered_findings.add(finding_key)
                     sections.append(finding.statement + " " + " ".join(dict.fromkeys(
                         f"[来源]({sources[eid].url})" for eid in finding.evidence_ids)))
             if research.missing_items:
@@ -594,7 +600,16 @@ class DeterministicSynthesizer:
             if state.completion and state.completion.status == "PARTIAL":
                 from ..research.failures import failure_summary
                 sections.extend(failure_summary(research))
-            return prefix + ("\n\n".join(sections) or "当前没有可引用的已核验事实。")
+            if sections:
+                return prefix + "\n\n".join(dict.fromkeys(sections))
+            diagnostics = research.diagnostics
+            if diagnostics.get("web_attempted") or diagnostics.get("web_provider"):
+                attempted = diagnostics.get("web_targets_attempted", [])
+                targets = "、".join(dict.fromkeys(str(item.get("university", ""))
+                    for item in attempted if item.get("university"))) or "登记的官方域名"
+                return prefix + f"我已尝试检索{targets}的官方页面，但这次没有形成可直接引用的正文。" \
+                    "请补充学校或项目的完整名称，我会继续从对应官网页面查找。"
+            return prefix + "当前结果中还没有可直接引用的官网原文；请提供学校和项目名称，我会按已登记官方域名检索。"
         if state.plan_result and state.plan_result.timeline:
             return "我已整理申请时间线和下一步建议。"
         return prefix + "我已理解你的问题。"
@@ -614,7 +629,14 @@ def _research_for_synthesis(result: ResearchResult | None) -> dict[str, Any] | N
     payload = result.model_dump(mode="json", exclude={"diagnostics", "route_history"})
     from ..research.failures import failure_summary
     payload["failure_summary"] = failure_summary(result)
-    evidence = {e.evidence_id: e for e in [*result.evidence, *(e for p in result.programs for e in p.evidence)]}
+    payload["research_diagnostics"] = {
+        key: result.diagnostics[key] for key in (
+            "web_provider", "web_fallback_reason", "web_targets_attempted", "web_discovery",
+            "pages_checked", "official_pages_read", "search_calls", "page_calls", "web_rejections",
+            "errors", "persist_errors") if key in result.diagnostics
+    }
+    evidence = {e.evidence_id: e for e in merge_evidence(
+        [*result.evidence, *(e for p in result.programs for e in p.evidence)])}
     payload["evidence"] = [e.model_dump(mode="json") for e in evidence.values()]
     for program, source in zip(payload.get("programs", []), result.programs, strict=True):
         program["evidence_ids"] = [item.evidence_id for item in source.evidence]
@@ -623,7 +645,16 @@ def _research_for_synthesis(result: ResearchResult | None) -> dict[str, Any] | N
             if any(eid not in evidence for eid in fact["evidence_ids"]):
                 fact["verification_status"] = "unknown"
             fact["evidence_ids"] = [eid for eid in fact["evidence_ids"] if eid in evidence]
-    payload["findings"] = [f for f in payload["findings"] if f["evidence_ids"] and all(eid in evidence for eid in f["evidence_ids"])]
+    findings, seen_findings = [], set()
+    for finding in payload["findings"]:
+        if not finding["evidence_ids"] or not all(eid in evidence for eid in finding["evidence_ids"]):
+            continue
+        key = (finding["statement"].strip(), tuple(sorted(finding["evidence_ids"])))
+        if key in seen_findings:
+            continue
+        seen_findings.add(key)
+        findings.append(finding)
+    payload["findings"] = findings
     return payload
 
 
@@ -640,7 +671,11 @@ GRE policy, citation, or user preference. If research evidence is absent or a fi
 is unknown, say that it is unverified. For research facts, preserve source URLs from
 the supplied evidence as Markdown links when they are available; never fabricate a
 link. Do not cite a source that does not support the sentence immediately before it.
-  For ResearchResult, use only verified facts with their own evidence_ids. Unknown,
+When official-page findings are present, quote at least one exact excerpt in the answer.
+Never answer with only a generic “not found”, “database has no record”, or “I could
+not verify” statement: use research diagnostics to state which official-domain
+stage was attempted and what concrete follow-up is possible.
+For ResearchResult, use only verified facts with their own evidence_ids. Unknown,
 stale, conflicting, or relevance_passed=false evidence is not a verified fact.
 Each programme lists evidence_ids only; resolve them against research_result.evidence,
 which holds every evidence object exactly once.
