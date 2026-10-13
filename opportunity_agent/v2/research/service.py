@@ -67,7 +67,7 @@ class DiscoveredTargets(BaseModel):
 
 class ResearchService:
     def __init__(self, session, *, llm=None, retriever=None, web_factory=None,
-                 rerank=None, rewrite=None, threshold=None):
+                 rerank=None, rewrite=None, threshold=None, planner_llm=None):
         self.session = session
         self.catalog = ResearchCatalog(session)
         from .models import role_client
@@ -83,6 +83,8 @@ class ResearchService:
         # intact for tests/development; production parsing gets a bounded client.
         self.parse_llm = llm if llm is not None else role_client('parse', 6)
         self.discovery_llm = llm if llm is not None else role_client('discovery', 10)
+        self.model_agent_enabled = os.getenv("RESEARCH_AGENT_ENABLED", "1") == "1" and (llm is None or planner_llm is not None)
+        self.planner_llm = planner_llm or role_client('agent', seconds("RESEARCH_AGENT_MODEL_TIMEOUT_SECONDS", 110, 180))
         self.retriever = retriever or HybridRetriever(session)
         self._web_factory_explicit = web_factory is not None
         if web_factory is None:
@@ -108,8 +110,12 @@ class ResearchService:
         self._caller_deadline = self._started + budget
         self._deadline = self._caller_deadline
         self._budget_scope = asyncio.timeout(max(.01, budget))
+        self._as_of = date.today()
         try:
             async with self._budget_scope:
+                if self.model_agent_enabled:
+                    from .model_agent import ModelResearchAgent
+                    return await ModelResearchAgent(self, request, result).run()
                 return await self._execute(request, result)
         except TimeoutError:
             if not self._budget_scope.expired():

@@ -146,7 +146,7 @@ def test_one_slow_school_cannot_spend_the_next_schools_allowance(monkeypatch):
     async def run():
         service = ResearchService(None, llm=SimpleNamespace(enabled=False), web_factory=Web)
         accepted = []
-        async def accept(task, result, target, page):
+        async def accept(task, result, target, page, **kwargs):
             if "Brown" in target.university:
                 await asyncio.sleep(.3)
             accepted.append(target.university)
@@ -196,7 +196,7 @@ def test_search_or_page_failure_does_not_abort_other_schools(failed_stage):
     async def run():
         service = ResearchService(None, llm=SimpleNamespace(enabled=False), web_factory=FaultWeb)
         accepted = []
-        async def accept(task, result, target, page): accepted.append(target.university)
+        async def accept(task, result, target, page, **kwargs): accepted.append(target.university)
         service._accept_page = accept
         result = ResearchResult()
         await service._web(parse_task(request()), result, targets())
@@ -209,7 +209,7 @@ def test_repairs_prioritize_unattempted_targets_and_skip_seen_pages():
     async def run():
         service = ResearchService(None, llm=SimpleNamespace(enabled=False), web_factory=Web)
         accepted = []
-        async def accept(task, result, target, page):
+        async def accept(task, result, target, page, **kwargs):
             accepted.append(target.university)
             if "Brown" in target.university:
                 raise TimeoutError("offline fault")

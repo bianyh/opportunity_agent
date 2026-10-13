@@ -541,7 +541,12 @@ class LocalDevelopmentAgents:
 
     async def execute(self, agent: AgentName, state: ExecutionState,
                       missing_task: MissingTask | None = None) -> ProfileResult | ResearchResult | PlanResult:
-        return await asyncio.to_thread(execute_domain_request, request_from_state(agent, state, missing_task))
+        request = request_from_state(agent, state, missing_task)
+        if agent == "research":
+            from ..core.progress import relay_progress
+            async with relay_progress(request, state):
+                return await asyncio.to_thread(execute_domain_request, request)
+        return await asyncio.to_thread(execute_domain_request, request)
 
 
 class DeterministicSynthesizer:
@@ -556,6 +561,24 @@ class DeterministicSynthesizer:
             if any(term in message for term in ("焦虑", "紧张", "害怕", "担心", "压力")):
                 return "我理解申请过程会让人紧张。我们可以先把你最担心的一件事拆成一个小步骤。"
             return "你好，我在。无论是申请规划、项目查询还是准备过程中的困惑，都可以直接告诉我。"
+        if state.research_result and state.research_result.diagnostics.get("model_research"):
+            research = state.research_result
+            evidence = {e.evidence_id: e for e in research.evidence}
+            sections = []
+            for finding in research.findings:
+                links = list(dict.fromkeys(f"[官网来源]({evidence[eid].url})" for eid in finding.evidence_ids if eid in evidence))
+                if links:
+                    sections.append(finding.statement + "\n" + " ".join(links))
+            for p in research.programs:
+                for fact in p.facts:
+                    if fact.verification_status == "verified":
+                        links = list(dict.fromkeys(f"[官网来源]({e.url})" for e in p.evidence if e.evidence_id in fact.evidence_ids))
+                        sections.append(f"{p.university} {p.program}：{fact.field} {fact.value} " + " ".join(links))
+            questions = [q.get("explanation", "") for q in research.diagnostics.get("question_outcomes", [])
+                         if q.get("status") != "answered" and q.get("explanation")]
+            if questions:
+                sections.append("需要补充或继续处理的事项：" + "；".join(questions))
+            return "\n\n".join(sections) or "研究模型本轮未完成问题理解，未使用规则解析器猜测查询目标。请重试。"
         if state.completion and state.completion.status == "NEED_USER":
             return "为了继续处理，我还需要你补充：" + "；".join(state.completion.reasons)
         prefix = ""
@@ -640,6 +663,9 @@ def _research_for_synthesis(result: ResearchResult | None) -> dict[str, Any] | N
             "pages_checked", "official_pages_read", "search_calls", "page_calls", "web_rejections",
             "errors", "persist_errors") if key in result.diagnostics
     }
+    if result.diagnostics.get("model_research"):
+        payload["research_plan"] = result.diagnostics.get("research_plan", {})
+        payload["question_outcomes"] = result.diagnostics.get("question_outcomes", [])
     evidence = {e.evidence_id: e for e in merge_evidence(
         [*result.evidence, *(e for p in result.programs for e in p.evidence)])}
     payload["evidence"] = [e.model_dump(mode="json") for e in evidence.values()]
@@ -704,6 +730,13 @@ Never describe LLM extraction failure as an inaccessible official website.
 If completion is NEED_USER, ask only
 for the listed missing information. If completion is FAIL, explain only the listed
 failure at a high level; do not fabricate a partial research answer.
+For model-directed research, question_outcomes is the authoritative per-item status:
+answer every answered item using its supplied claims/evidence, and ask only the
+specific unresolved item's clarification. Never say an item was searched when its
+status is needs_user. Do not let one ambiguous item suppress the other answers.
+Use research_plan's inherited intake consistently; do not override it with a default.
+For current annual deadlines without a calendar year, state the useful month/day
+and the missing source year explicitly, not a generic unverified/no-result response.
 
 For ProfileResult, present extracted facts and progress updates as candidate changes
 and state that they require user confirmation before any persistent update. For a
@@ -907,7 +940,9 @@ class CustomOrchestrator:
             notice = "；".join(f"将你输入的 {c['input']} 按 {c['university']} 的 {c['resolved']} 项目查询" for c in corrections)
             state.answer = notice + "。\n\n" + state.answer
         if task.get("intake_defaulted"):
-            notice = "本次未指定入学年份，按默认 2027 年查询；未指定学期时不默认秋季。"
+            notice = ("本轮按默认 2027 年查询；各项目的具体入学季以所引用的官网原文说明为准。"
+                      if state.research_result.diagnostics.get("model_research") else
+                      "本次未指定入学年份，按默认 2027 年查询；未指定学期时不默认秋季。")
             state.answer = notice + "\n\n" + state.answer
 
     async def _run(self, state: ExecutionState) -> ExecutionState:
@@ -1001,7 +1036,9 @@ class CustomOrchestrator:
 
         # The target parser has already identified a required clarification.
         # Do not spend retrieval/tool budget on an underspecified constraint.
-        if state.success_criteria and state.success_criteria.needs_user_input:
+        if (state.success_criteria and state.success_criteria.needs_user_input
+                and not (os.getenv("RESEARCH_AGENT_ENABLED", "1") == "1"
+                         and "research" in state.route_decision.agents)):
             state.completion = CompletionResult(status="NEED_USER", reasons=state.success_criteria.needs_user_input)
             state.add_event("completion_checked", **state.completion.model_dump(mode="json"))
             if state.turn_preferences:
@@ -1147,7 +1184,8 @@ class CustomOrchestrator:
     @staticmethod
     def _check_completion(state: ExecutionState) -> CompletionResult:
         criteria = state.success_criteria
-        if criteria and criteria.needs_user_input:
+        model_finished = bool(state.research_result and state.research_result.diagnostics.get("model_agent_finished"))
+        if criteria and criteria.needs_user_input and not model_finished:
             return CompletionResult(status="NEED_USER", reasons=criteria.needs_user_input)
         if state.agent_failures:
             return CompletionResult(
@@ -1179,6 +1217,21 @@ class CustomOrchestrator:
         if "research" in selected:
             research_criteria = criteria or SuccessCriteria(evidence_required=True)
             research = state.research_result
+            if research and research.diagnostics.get("model_agent_finished"):
+                outcomes = research.diagnostics.get("question_outcomes", [])
+                if not outcomes:
+                    return CompletionResult(status="PARTIAL", reasons=[
+                        "研究模型未完成问题理解；本轮没有用规则解析器猜测或丢弃查询目标。"])
+                unresolved = [q for q in outcomes if q.get("status") != "answered"]
+                if unresolved:
+                    # Mixed answers + one clarification are a useful partial
+                    # answer, not a global NEED_USER that discards evidence.
+                    return CompletionResult(status="NEED_USER" if all(q.get("status") == "needs_user" for q in outcomes)
+                        else "PARTIAL",
+                        reasons=[q.get("explanation") or q.get("original_text", "研究事项未完成") for q in unresolved])
+                if outcomes and (research.findings or research.programs):
+                    if "planning" not in selected:
+                        return CompletionResult(status="PASS")
             if research and any(item.get("kind") == "needs_user" for item in research.missing_items):
                 return CompletionResult(status="NEED_USER", reasons=[item.get("reason", "请补充研究目标")
                     for item in research.missing_items if item.get("kind") == "needs_user"])

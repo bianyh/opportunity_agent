@@ -56,6 +56,8 @@ class DomainA2ARequest(BaseModel):
     missing_task: MissingTask | None = None
     remaining_budget_seconds: float = Field(default=600, gt=0, le=3600)
     research_progress: dict[str, Any] = Field(default_factory=dict)
+    # Research needs dialogue references, but never a mutable profile snapshot.
+    research_context: dict[str, Any] = Field(default_factory=dict)
     research_tool_state: dict[str, Any] = Field(default_factory=dict)
     progress_channel: str = Field(default="", pattern=r"^(?:[a-f0-9]{32})?$")
     round_id: int = Field(default=0, ge=0)
@@ -77,7 +79,7 @@ class DomainA2ARequest(BaseModel):
     def wire_json(self) -> str:
         # Only Research consumes new repair metadata. Keep Profile/Planning's
         # existing strict wire schema compatible during a rolling deployment.
-        return self.model_dump_json(exclude={"research_progress", "research_tool_state", "progress_channel"} if self.agent != "research" else None)
+        return self.model_dump_json(exclude={"research_progress", "research_context", "research_tool_state", "progress_channel"} if self.agent != "research" else None)
 
     @model_validator(mode="after")
     def validate_agent_scope(self) -> "DomainA2ARequest":
@@ -87,6 +89,8 @@ class DomainA2ARequest(BaseModel):
                                                self.current_plan, self.current_tasks, self.research_result,
                                                self.recent_messages, self.conversation_context)):
             raise ValueError("research requests must not include a user state snapshot")
+        if self.research_context and (self.agent != "research" or set(self.research_context) - {"recent_messages", "summary"}):
+            raise ValueError("research context is dialogue-only")
         return self
 
 
@@ -118,12 +122,19 @@ def request_from_state(
              and state.route_decision.resolved_query else state.message)
     allowance = research_seconds(estimate_school_count(query,
         state.success_criteria.required_program_count if state.success_criteria else None)) if agent == "research" else 55.
+    if agent == "research" and os.getenv("RESEARCH_AGENT_ENABLED", "1") == "1":
+        # Don't let the legacy keyword count decide a model plan's capacity.
+        # The agent enforces its own item/call limits within this hard ceiling.
+        from ..core.research_budget import seconds, research_limit
+        allowance = min(research_limit(), max(allowance, seconds("RESEARCH_AGENT_BUDGET_SECONDS", 300)))
     if getattr(state, "_execution_deadline", None):
         allowance = min(allowance, state._execution_deadline - time.monotonic()
                         - (synthesis_reserve() if agent == "research" else 0))
     return DomainA2ARequest(
         progress_channel=uuid.uuid4().hex if agent == "research" and os.getenv("RESEARCH_PROGRESS_ENABLED", "0") == "1" else "",
         agent=agent,
+        research_context={"recent_messages": (state.conversation_context.get("recent_messages") or state.recent_messages)[-8:],
+                          "summary": state.conversation_context.get("summary", "")} if agent == "research" else {},
         user_id=state.user_id,
         conversation_id=state.conversation_id,
         run_id=state.run_id,

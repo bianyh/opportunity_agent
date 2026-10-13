@@ -705,6 +705,46 @@ class OfficialWeb:
                 return found
         return []
 
+    async def model_search(self, query, domains):
+        """Real search results for model selection; never admissions evidence.
+
+        No provider key is sent to public search. Model-written queries are
+        preserved; official-host filtering is the only semantic-independent gate.
+        """
+        if self.client is None:
+            return []
+        found = []
+        for search_query in (query, query + " " + " ".join("site:" + d for d in domains)):
+            try:
+                response = await self.client.get("https://www.bing.com/search", params={
+                    "q": search_query, "format": "rss", "setlang": "en-US", "cc": "US"},
+                    headers={"Accept-Language":"en-US,en;q=0.9"}, follow_redirects=True)
+                response.raise_for_status()
+                root = ElementTree.fromstring(response.content)
+                for item in root.findall(".//item"):
+                    url = item.findtext("link") or ""
+                    if self._allowed(url, domains):
+                        found.append({"url": url, "title": item.findtext("title") or "",
+                                      "content": item.findtext("description") or ""})
+            except Exception:
+                continue
+            if found:
+                break
+        if not found:
+            # Bing may return an HTML result page after RSS throttling. Parse
+            # only its direct HTTPS links; host validation still happens below.
+            try:
+                response = await self.client.get("https://www.bing.com/search", params={"q": query},
+                    headers={"Accept-Language":"en-US,en;q=0.9"}, follow_redirects=True)
+                parser = _SearchResultParser(); parser.feed(response.text)
+                for href, title in parser.links:
+                    candidate = urljoin(str(response.url), html.unescape(href)).split("#",1)[0]
+                    if self._allowed(candidate, domains):
+                        found.append({"url":candidate,"title":title,"content":"search navigation"})
+            except Exception:
+                pass
+        return list({r["url"]: r for r in found}.values())[:8]
+
     async def search(self, query, domains=()):
         if self.search_calls >= self.search_limit:
             raise RuntimeError("Research search budget exhausted")
@@ -712,6 +752,11 @@ class OfficialWeb:
         domains = tuple(str(d).casefold().rstrip(".") for d in domains)
         if not domains:
             return {"results": [], "diagnostic": "no_registered_domain"}
+        if getattr(self, "model_directed", False):
+            results = await self.model_search(query, domains)
+            custom = await self._search_engine(query, domains) if os.getenv("OFFICIAL_SEARCH_URL") else []
+            results.extend({"url": u, "title": t, "content": "search navigation"} for u, t in custom)
+            return {"results": results, "diagnostic": {"provider": "bing_rss", "search_candidates": len(results)}}
         from .program_directory import navigation_entries
         entries = list(navigation_entries(query))
         seeds = [url for entry in entries for url in entry["urls"] if self._allowed(url, domains)]
@@ -771,6 +816,11 @@ class OfficialWeb:
             raise RuntimeError("Research page budget exhausted")
         if precise_errors:
             await self.validate_url(url, domains)
+        if getattr(self, "model_directed", False):
+            host = (urlparse(url).hostname or "").casefold()
+            if host not in self._robots_rules:
+                robots = await self._fetch(f"https://{host}/robots.txt", domains, max_bytes=512*1024, soft=True)
+                self._robots_rules[host] = self._parse_robots(_decode_html(robots[2], robots[1])) if robots else []
         if not self._robots_allowed(url):
             raise ValueError("robots.txt disallows this official URL")
         self.page_calls += 1
@@ -785,8 +835,17 @@ class OfficialWeb:
             text = re.sub(r"\s+", " ", html.unescape(html_text)).strip()
         if len(text.strip()) < 80:
             raise ValueError("Official page has no readable text")
+        link_parser = _SearchResultParser()
+        link_parser.feed(html_text)
+        links = []
+        seen_links = set()
+        for href, label in link_parser.links:
+            candidate = urljoin(final_url, html.unescape(href)).split("#", 1)[0]
+            if candidate not in seen_links and self._allowed(candidate, domains):
+                seen_links.add(candidate)
+                links.append({"url": candidate, "title": label[:200]})
         return {"url": final_url, "title": _page_title(html_text) or final_url,
-                "text": text[:200000], "read_method": "direct_official"}
+                "text": text[:200000], "links": links[:120], "read_method": "direct_official"}
 
     async def read(self, url, domains):
         return await self._read_direct(url, domains)
